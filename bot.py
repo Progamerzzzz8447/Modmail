@@ -1655,6 +1655,13 @@ class ModmailBot(commands.Bot):
                 logger.warning("Failed to find linked message for reactions: %s", e)
                 return
         else:
+            # Components V2 / LayoutView messages do not have embeds, so they are
+            # not relay messages and should not be passed into find_linked_messages.
+            # Without this guard, the bot logs "Malformed note message" whenever
+            # someone reacts to the ticket-opened V2 message. Lovely little Discord tax.
+            if message.author == self.user and not message.embeds:
+                return
+
             try:
                 _, *linked_messages = await thread.find_linked_messages(
                     message1=message, either_direction=True
@@ -1871,6 +1878,12 @@ class ModmailBot(commands.Bot):
             return
 
         if message.author != self.user:
+            return
+
+        # Components V2 / LayoutView messages do not have embeds and are not
+        # mirrored relay messages, so deleting them should not trigger linked
+        # message deletion logic.
+        if not message.embeds:
             return
 
         thread = await self.threads.find(channel=message.channel)
