@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import discord
 import isodate
-from aiohttp import ClientSession, ClientResponseError
+from aiohttp import ClientSession, ClientResponseError, web
 from discord.ext import commands, tasks
 from discord.ext.commands.view import StringView
 from emoji import is_emoji
@@ -234,6 +234,24 @@ class ModmailBot(commands.Bot):
             async with self:
                 self._connected = asyncio.Event()
                 self.session = ClientSession(loop=self.loop)
+                health_runner = web.AppRunner(
+                    web.Application()
+                )
+                health_runner.app.router.add_get(
+                    "/",
+                    lambda request: web.json_response({"status": "ok", "service": "modmail"}),
+                )
+                health_runner.app.router.add_get(
+                    "/health",
+                    lambda request: web.json_response({"status": "ok"}),
+                )
+                await health_runner.setup()
+                await web.TCPSite(
+                    health_runner,
+                    "0.0.0.0",
+                    int(os.environ.get("PORT", "10000")),
+                ).start()
+                logger.info("Health server listening on port %s.", os.environ.get("PORT", "10000"))
 
                 if self.config["enable_presence_intent"]:
                     logger.info("Starting bot with presence intent.")
@@ -251,6 +269,7 @@ class ModmailBot(commands.Bot):
                 except Exception:
                     logger.critical("Fatal exception", exc_info=True)
                 finally:
+                    await health_runner.cleanup()
                     if self.session:
                         await self.session.close()
                     if not self.is_closed():
