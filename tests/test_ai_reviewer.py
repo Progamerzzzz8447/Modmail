@@ -1,0 +1,1455 @@
+import asyncio
+import json
+import unittest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from core.ai_reviewer import (
+    AI_ALL_CLOSING,
+    AI_ACKNOWLEDGEMENT_TRIGGERS,
+    AI_ACKNOWLEDGEMENT_CONTAINS_TRIGGERS,
+    AI_HELLO_MESSAGES,
+    AI_INTAKE_GREETING,
+    AI_INTAKE_MAX_QUESTIONS,
+    AI_TICKET_CLOSED_MESSAGE,
+    FORM_AUTOFILL_NOTICE,
+    AI_HELLO_FOOTER,
+    AI_REPLY_FOOTER,
+    NO_MATCH,
+    ROBLOX_GAME_PASS_AUTOREPLY,
+    TUI_SUPPORT_ASSISTANT_POLICY,
+    GeminiAnnoyReplyGenerator,
+    GeminiAutoReplyReviewer,
+    GeminiContinuousTestReplyGenerator,
+    GeminiFormAutofill,
+    GeminiFlightLogConfirmationClassifier,
+    GeminiHelpfulReplyGenerator,
+    GeminiIntakeAssessment,
+    GeminiTicketChannelSummaryGenerator,
+    GeminiTicketSummaryGenerator,
+    build_autoreply_context,
+    apply_form_autofills,
+    build_relayed_reply_transcript,
+    count_logged_intake_questions,
+    build_ticket_text,
+    describe_ai_error,
+    decode_ai_text_attachment,
+    extract_blank_form_fields,
+    enforce_recipient_discord_username,
+    finalize_generated_ai_reply,
+    form_value_requires_exact_evidence,
+    find_command_references,
+    generate_ai_message_joint_id,
+    has_application_trigger,
+    has_application_start_intent,
+    has_configured_trigger,
+    has_department_transfer_intent,
+    has_roblox_game_pass_url,
+    is_acknowledgement_only,
+    is_ticket_routing_request,
+    last_relayed_message_is_human_staff,
+    normalize_generated_reply_layout,
+    parse_aireply_argument,
+    recipient_username_form_fills,
+    recipient_evidence_from_transcript,
+    resolve_ai_autoreply_type,
+)
+
+
+class FakeResponse:
+    def __init__(self, status, data, *, headers=None):
+        self.status = status
+        self.data = data
+        self.headers = headers or {}
+        self.released = False
+
+    async def __aenter__(self):
+        if isinstance(self.data, BaseException):
+            raise self.data
+        return self
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self.released = True
+        return False
+
+    async def json(self):
+        return self.data
+
+
+class FakeSession:
+    def __init__(self, response):
+        self.responses = response if isinstance(response, list) else [response]
+        self.request = None
+        self.requests = []
+        self.calls = 0
+
+    def post(self, url, **kwargs):
+        self.request = (url, kwargs)
+        self.requests.append(self.request)
+        response = self.responses[min(self.calls, len(self.responses) - 1)]
+        self.calls += 1
+        return response
+
+
+def generate_content_output(value):
+    return {
+        "candidates": [
+            {"content": {"role": "model", "parts": [{"text": json.dumps(value)}]}}
+        ]
+    }
+
+
+class GeminiAutoReplyReviewerTests(unittest.IsolatedAsyncioTestCase):
+    def test_fenced_alias_form_autofill_preserves_surrounding_text(self):
+        alias = (
+            "Please complete this report form.\n\n"
+            "```\nROBLOX USERNAME:\n**YOUR DISCORD USERNAME:**\n"
+            "THEIR DISCORD USERNAME:\nWhat did you purchase\nWhat issue occurred\n"
+            "```\n\nAttach evidence if available."
+        )
+        fields = extract_blank_form_fields(alias)
+        self.assertEqual(
+            fields,
+            [
+                {"field_id": "field_1", "label": "ROBLOX USERNAME"},
+                {"field_id": "field_2", "label": "YOUR DISCORD USERNAME"},
+                {"field_id": "field_3", "label": "THEIR DISCORD USERNAME"},
+                {"field_id": "field_4", "label": "What did you purchase"},
+                {"field_id": "field_5", "label": "What issue occurred"},
+            ],
+        )
+        rendered = apply_form_autofills(
+            alias,
+            {
+                "field_1": "1231431421",
+                "field_2": "recipient_name",
+                "field_4": "Comfort seat upgrade",
+                "field_5": "Unknown error while using the upgrade",
+            },
+        )
+        self.assertIn("Please complete this report form.", rendered)
+        self.assertIn(FORM_AUTOFILL_NOTICE, rendered)
+        self.assertEqual(
+            FORM_AUTOFILL_NOTICE,
+            "Fields marked (A) have been auto-filled based on the information you have already "
+            "provided, but may require additional details.",
+        )
+        self.assertIn("ROBLOX USERNAME (A): 1231431421", rendered)
+        self.assertIn("**YOUR DISCORD USERNAME (A):** recipient_name", rendered)
+        self.assertIn("THEIR DISCORD USERNAME:\n", rendered)
+        self.assertIn("What did you purchase (A): Comfort seat upgrade", rendered)
+        self.assertIn(
+            "What issue occurred (A): Unknown error while using the upgrade",
+            rendered,
+        )
+        self.assertTrue(rendered.endswith("Attach evidence if available."))
+
+    def test_recipient_discord_username_is_a_trusted_form_fill(self):
+        fields = [
+            {"field_id": "field_1", "label": "YOUR DISCORD USERNAME"},
+            {"field_id": "field_2", "label": "DISCORD USERNAME"},
+            {"field_id": "field_3", "label": "THEIR DISCORD USERNAME"},
+            {"field_id": "field_4", "label": "ROBLOX USERNAME"},
+            {"field_id": "field_5", "label": "YOUR ROBLOX USERNAME"},
+        ]
+        self.assertEqual(
+            recipient_username_form_fills(fields, "ticket_writer"),
+            {"field_1": "ticket_writer", "field_2": "ticket_writer"},
+        )
+        rendered = enforce_recipient_discord_username(
+            "Intro\n\nDISCORD USERNAME\nROBLOX USERNAME\nROLE APPLIED FOR\n",
+            "ticket_writer",
+        )
+        self.assertIn("DISCORD USERNAME (A): ticket_writer", rendered)
+        self.assertIn("ROBLOX USERNAME\n", rendered)
+        self.assertIn(FORM_AUTOFILL_NOTICE, rendered)
+
+    def test_username_evidence_ignores_staff_and_ai_messages(self):
+        transcript = (
+            "[RECIPIENT MESSAGE]\nMy Roblox username is ActualRoblox\n\n---\n\n"
+            "[STAFF MESSAGE]\nMaybe their username is WrongName\n\n---\n\n"
+            "[BOT OR AI MESSAGE]\nDISCORD USERNAME: BotGuess"
+        )
+        evidence = recipient_evidence_from_transcript(transcript)
+        self.assertIn("ActualRoblox", evidence)
+        self.assertNotIn("WrongName", evidence)
+        self.assertNotIn("BotGuess", evidence)
+
+    def test_plain_uppercase_form_run_is_detected_when_fences_are_missing(self):
+        alias = (
+            "To allow us to review your case, please provide:\n\n"
+            "DISCORD USERNAME\nDISCIPLINARY TYPE\nDISCIPLINARY REASON\n"
+            "REASON FOR APPEAL\nEVIDENCE, IF APPLICABLE\n\nPlease allow 48 hours."
+        )
+        fields = extract_blank_form_fields(alias)
+        self.assertEqual(len(fields), 5)
+        rendered = apply_form_autofills(alias, {"field_1": "ticket_writer"})
+        self.assertIn(FORM_AUTOFILL_NOTICE, rendered)
+        self.assertIn("DISCORD USERNAME (A): ticket_writer", rendered)
+        self.assertIn("Please allow 48 hours.", rendered)
+
+    def test_attached_fences_are_preserved_and_not_treated_as_field_text(self):
+        alias = "Intro\n```DISCORD USERNAME\n~ DATE OF APPLICATION```\nAfter"
+        fields = extract_blank_form_fields(alias)
+        self.assertEqual(
+            fields,
+            [
+                {"field_id": "field_1", "label": "DISCORD USERNAME"},
+                {"field_id": "field_2", "label": "~ DATE OF APPLICATION"},
+            ],
+        )
+        rendered = apply_form_autofills(alias, {"field_1": "ticket_writer"})
+        self.assertIn("```\nDISCORD USERNAME (A): ticket_writer", rendered)
+        self.assertIn("~ DATE OF APPLICATION\n```\nAfter", rendered)
+        self.assertNotIn("APPLICATION``` (A)", rendered)
+
+    def test_sensitive_form_values_require_exact_recipient_evidence(self):
+        for label in (
+            "DISCORD USERNAME",
+            "DATE OF APPLICATION",
+            "FLIGHT CODE",
+            "AMOUNT PAID",
+            "APPLICATION ID",
+        ):
+            self.assertTrue(form_value_requires_exact_evidence(label))
+        self.assertFalse(form_value_requires_exact_evidence("REASON FOR APPEAL"))
+
+    async def test_gemini_form_autofill_returns_only_structured_field_values(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output(
+                    {"fills": [{"field_id": "field_1", "value": "ExampleUser"}]}
+                ),
+            )
+        )
+        reviewer = GeminiFormAutofill(session, "key", model="gemini-3.1-flash-lite")
+        fills = await reviewer.identify_fills(
+            "[RECIPIENT MESSAGE]\nMy Roblox username is ExampleUser.",
+            [{"field_id": "field_1", "label": "ROBLOX USERNAME"}],
+        )
+        self.assertEqual(fills, {"field_1": "ExampleUser"})
+        prompt = session.request[1]["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("Use recipient-authored messages as the source", prompt)
+        self.assertIn('"label": "ROBLOX USERNAME"', prompt)
+
+    def test_acknowledgements_cannot_trigger_an_onboarding_autoreply(self):
+        self.assertIn("ok thanks", AI_ACKNOWLEDGEMENT_TRIGGERS)
+        self.assertIn("tysm", AI_ACKNOWLEDGEMENT_CONTAINS_TRIGGERS)
+        for message in ("ok thanks", "Thank you!", "got it", "perfect, thanks sir"):
+            with self.subTest(message=message):
+                self.assertTrue(is_acknowledgement_only(message))
+        for message in (
+            "Thanks, but where are my results?",
+            "Okay, I need to appeal.",
+            "nope that is all for today",
+            "tysm, that's all",
+            "nothing",
+            "Nothing else, thank you",
+            "nah that's everything",
+            "No further questions from me",
+            "I'm good now, cheers",
+            "That answers everything",
+            "All sorted now",
+            "Much appreciated, that will be all",
+            "close",
+            "Please close the ticket",
+            "You can close this now",
+            "Resolved, feel free to close",
+        ):
+            with self.subTest(message=message):
+                self.assertTrue(is_acknowledgement_only(message))
+        self.assertFalse(is_acknowledgement_only("knowledge"))
+        self.assertFalse(
+            is_acknowledgement_only(
+                "Thanks " + "this is deliberately a much longer substantive message " * 3
+            )
+        )
+
+    def test_automatic_aibye_uses_requested_closure_message(self):
+        self.assertTrue(AI_TICKET_CLOSED_MESSAGE.startswith("Thank you for reaching out"))
+        self.assertNotIn(":Disconnected2:", AI_TICKET_CLOSED_MESSAGE)
+        self.assertIn("**closed automatically**", AI_TICKET_CLOSED_MESSAGE)
+        self.assertIn("a **new ticket will automatically be created**", AI_TICKET_CLOSED_MESSAGE)
+
+    def test_intake_greeting_and_durable_two_question_cap(self):
+        self.assertIn("Please tell me why you're opening a ticket", AI_INTAKE_GREETING)
+        self.assertEqual(AI_INTAKE_MAX_QUESTIONS, 2)
+        messages = [
+            {
+                "author": {"id": "999", "mod": True},
+                "content": f"[AI autoreply: Intake clarification]\nQuestion {index}",
+            }
+            for index in range(5)
+        ]
+        messages.extend(
+            [
+                {"author": {"id": "100", "mod": False}, "content": "Recipient reply"},
+                {"author": {"id": "999", "mod": True}, "content": "Other AI output"},
+            ]
+        )
+        self.assertEqual(count_logged_intake_questions(messages, bot_user_id=999), 5)
+
+    def test_autoreply_alternatives_share_the_parent_group_duplicate_type(self):
+        primary = {"alias": "application-review", "group": "application timing"}
+        alternative = {"alias": "missing-results", "group": "application timing"}
+        self.assertEqual(
+            resolve_ai_autoreply_type("Application review time", primary),
+            "group:application timing",
+        )
+        self.assertEqual(
+            resolve_ai_autoreply_type("Missing application results", alternative),
+            "group:application timing",
+        )
+        self.assertNotEqual(
+            resolve_ai_autoreply_type(
+                "Ground Operations application",
+                {"alias": "ground-ops", "group": "ground operations"},
+            ),
+            "group:application timing",
+        )
+
+    async def test_continuous_ai_test_asks_clarification_before_human_handoff(self):
+        generator = GeminiContinuousTestReplyGenerator(FakeSession([]), "test-key")
+        prompt = generator.build_prompt("[RECIPIENT MESSAGE]\nI need help with my ticket.")
+
+        self.assertIn("HUMAN_ASSISTANCE_REQUIRED: reason", prompt)
+        self.assertIn("ask a targeted clarification question first", prompt)
+        self.assertIn("Do not claim", prompt)
+
+    async def test_role_name_alone_cannot_send_an_application_form(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": "Ramp application"}))
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "Ground crew",
+            {
+                "Ramp application": (
+                    "Ramp Agent Fast Track Application\nDiscord Username:\nDiscord ID:\n"
+                    "Roblox Username:\nWhat device are you working on?\n"
+                    "Do you have a working microphone?"
+                )
+            },
+            context_messages=[
+                {"speaker": "recipient", "message": "When do I get the ticket?"},
+                {"speaker": "human_staff", "message": "Which service?"},
+                {"speaker": "recipient", "message": "Service"},
+                {
+                    "speaker": "ai_or_bot_reply",
+                    "message": "Please clarify which department or service this concerns.",
+                },
+            ],
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(reviewer.last_outcome, "no_match")
+        self.assertEqual(session.calls, 0)
+        self.assertFalse(has_application_start_intent("Ground crew"))
+        self.assertTrue(has_application_start_intent("I want to apply for ground crew"))
+
+    async def test_ticket_channel_summary_is_staff_focused_and_uses_complete_transcript(self):
+        generator = GeminiTicketChannelSummaryGenerator(FakeSession([]), "test-key")
+        transcript = "RECIPIENT MESSAGE: My application vanished.\nSTAFF-SENT MESSAGE: Checking."
+
+        prompt = generator.build_prompt(transcript)
+
+        self.assertIn("Summarize the complete support ticket for staff", prompt)
+        self.assertIn("current status", prompt)
+        self.assertIn(transcript, prompt)
+        self.assertIn("Do not invent", prompt)
+
+    async def test_intake_assessment_returns_clarity_resolution_and_remaining_inquiries(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output(
+                    {
+                        "clear": True,
+                        "resolved": False,
+                        "remaining_inquiries": ["gamepass payment timing"],
+                        "clarification_question": "",
+                        "ticket_summary": "Recipient is asking about a gamepass payment.",
+                        "primary_question": "When will the gamepass payment arrive?",
+                        "selected_autoreply": "Payment timing",
+                        "handoff_team": "Human Resources",
+                        "form_fills": [
+                            {"field_id": "field_1", "value": "Comfort seat upgrade"}
+                        ],
+                    }
+                ),
+            )
+        )
+        assessor = GeminiIntakeAssessment(session, "key", model="gemini-3.5-flash")
+
+        result = await assessor.assess(
+            "Recipient asked when payment arrives.",
+            autoreply_sent=True,
+            questions_asked=3,
+            autoreply_catalog={"Payment timing": "payment-alias"},
+            autoreply_guidance={"Payment timing": "Never promise payment before staff approval."},
+            autoreply_forms={
+                "Payment timing": [
+                    {"field_id": "field_1", "label": "What did you purchase"}
+                ]
+            },
+            trigger_matched_autoreplies=["Payment timing"],
+            trusted_recipient_username="ticket_writer",
+            handoff_teams={
+                "General Support Staff": "General enquiries.",
+                "Human Resources": "Staff conduct and disciplinary matters.",
+            },
+        )
+
+        self.assertTrue(result["clear"])
+        self.assertFalse(result["resolved"])
+        self.assertEqual(result["remaining_inquiries"], ["gamepass payment timing"])
+        self.assertEqual(result["ticket_summary"], "Recipient is asking about a gamepass payment.")
+        self.assertEqual(result["primary_question"], "When will the gamepass payment arrive?")
+        self.assertEqual(result["selected_autoreply"], "Payment timing")
+        self.assertEqual(result["handoff_team"], "Human Resources")
+        self.assertEqual(result["form_fills"], {"field_1": "Comfort seat upgrade"})
+        self.assertEqual(session.calls, 1)
+        config = session.request[1]["json"]["generationConfig"]
+        self.assertEqual(config["thinkingConfig"], {"thinkingLevel": "minimal"})
+        prompt = session.request[1]["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("Ask only for information that is indispensable", prompt)
+        self.assertIn("location plus approximate time", prompt)
+        self.assertIn("Never repeat a question", prompt)
+        self.assertIn("CLARIFICATION QUESTIONS ALREADY ASKED: 3", prompt)
+        self.assertIn("Hand the ticket to staff as early as reasonably possible", prompt)
+        self.assertIn("`ticket_summary`", prompt)
+        self.assertIn('"Payment timing": "payment-alias"', prompt)
+        self.assertIn('TRIGGER-MATCHED AUTOREPLIES (DISPLAY NAMES ONLY):', prompt)
+        self.assertIn('["Payment timing"]', prompt)
+        self.assertIn("MUST select it immediately", prompt)
+        self.assertIn("TRUSTED RECIPIENT DISCORD USERNAME: ticket_writer", prompt)
+        self.assertIn("For disciplinary appeals", prompt)
+        self.assertIn("they do not need to repeat the request or trigger words", prompt)
+        self.assertIn("`TRUSTED AI FEED`", prompt)
+        self.assertIn("do not treat them as recipient intent", prompt)
+        self.assertIn("SMART HANDOFF TEAMS", prompt)
+        self.assertIn("Never promise payment before staff approval.", prompt)
+        self.assertIn("outstanding clarification is substantive information", prompt)
+        self.assertIn("Academy trainee role", prompt)
+        self.assertIn("Use General Support Staff", prompt)
+        self.assertNotIn("Use the application form", prompt)
+
+    async def test_intake_cannot_resolve_ticket_with_outstanding_request(self):
+        session = FakeSession(FakeResponse(200, generate_content_output({
+            "clear": True,
+            "resolved": True,
+            "remaining_inquiries": ["Review the separate infraction appeal"],
+            "selected_autoreply": NO_MATCH,
+        })))
+        result = await GeminiIntakeAssessment(session, "key").assess(
+            "The warning is removed, but my infraction appeal is still outstanding.",
+            autoreply_sent=True,
+        )
+        self.assertFalse(result["resolved"])
+        self.assertTrue(result["clear"])
+        self.assertEqual(result["remaining_inquiries"], ["Review the separate infraction appeal"])
+
+    @patch("core.ai_reviewer.asyncio.sleep", new_callable=AsyncMock)
+    async def test_intake_assessment_retries_transient_failure_with_longer_timeout(self, sleep):
+        assessment = {
+            "clear": True,
+            "resolved": False,
+            "remaining_inquiries": ["suggestion review"],
+            "clarification_question": "",
+            "ticket_summary": "Recipient submitted a suggestion.",
+            "primary_question": "Can the team review this suggestion?",
+            "selected_autoreply": NO_MATCH,
+            "form_fills": [],
+        }
+        session = FakeSession(
+            [
+                FakeResponse(503, {}),
+                FakeResponse(200, generate_content_output(assessment)),
+            ]
+        )
+        assessor = GeminiIntakeAssessment(session, "key")
+
+        result = await assessor.assess(
+            "Please review my suggestion.",
+            autoreply_sent=False,
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(session.calls, 2)
+        self.assertEqual(session.request[1]["timeout"], 45)
+        self.assertEqual(assessor.last_outcome, "assessed")
+        self.assertEqual(assessor.last_detail, "Gemini assessed the opening intake.")
+        self.assertEqual(sleep.await_count, 1)
+
+    @patch("core.ai_reviewer.asyncio.sleep", new_callable=AsyncMock)
+    async def test_intake_keeps_service_errors_when_final_attempt_times_out(self, sleep):
+        responses = [FakeResponse(503, {}), FakeResponse(503, {}),
+                     FakeResponse(200, asyncio.TimeoutError())]
+        session = FakeSession(responses)
+        assessor = GeminiIntakeAssessment(session, "key")
+
+        async def check_released(delay):
+            self.assertTrue(responses[session.calls - 1].released)
+
+        sleep.side_effect = check_released
+        result = await assessor.assess("Please help.", autoreply_sent=False)
+
+        self.assertIsNone(result)
+        self.assertEqual(session.calls, 3)
+        self.assertEqual([request[1]["timeout"] for request in session.requests], [30, 45, 60])
+        self.assertEqual(assessor.last_outcome, "request_error")
+        self.assertEqual(assessor.last_detail.count("HTTP 503"), 2)
+        self.assertIn("not a quota error", assessor.last_detail)
+        self.assertIn("TimeoutError (request exceeded 60s; quota status unknown)", assessor.last_detail)
+        self.assertEqual(sleep.await_count, 2)
+        for call, lower, upper in zip(sleep.await_args_list, [2, 4], [3, 5]):
+            self.assertGreaterEqual(call.args[0], lower)
+            self.assertLessEqual(call.args[0], upper)
+
+    @patch("core.ai_reviewer.asyncio.sleep", new_callable=AsyncMock)
+    async def test_intake_honours_retry_after_and_reports_quota_throttling(self, sleep):
+        session = FakeSession(FakeResponse(429, {}, headers={"Retry-After": "12"}))
+        assessor = GeminiIntakeAssessment(session, "key")
+
+        self.assertIsNone(await assessor.assess("Please help.", autoreply_sent=False))
+
+        self.assertEqual(session.calls, 3)
+        self.assertEqual([call.args[0] for call in sleep.await_args_list], [12, 12])
+        self.assertEqual(assessor.last_outcome, "http_error")
+        self.assertIn("rate/quota throttling", assessor.last_detail)
+
+    @patch("core.ai_reviewer.asyncio.sleep", new_callable=AsyncMock)
+    async def test_intake_hands_off_for_long_retry_after_or_permanent_error(self, sleep):
+        for status, headers in [(503, {"Retry-After": "120"}), (400, {}), (403, {})]:
+            with self.subTest(status=status):
+                session = FakeSession(FakeResponse(status, {}, headers=headers))
+                assessor = GeminiIntakeAssessment(session, "key")
+                self.assertIsNone(await assessor.assess("Please help.", autoreply_sent=False))
+                self.assertEqual(session.calls, 1)
+                self.assertIn(f"HTTP {status}", assessor.last_detail)
+                sleep.assert_not_awaited()
+
+    @patch("core.ai_reviewer.asyncio.sleep", new_callable=AsyncMock)
+    async def test_intake_recovers_from_timeouts_and_malformed_retry_header(self, sleep):
+        session = FakeSession([
+            FakeResponse(200, asyncio.TimeoutError()),
+            FakeResponse(503, {}, headers={"Retry-After": "invalid"}),
+            FakeResponse(200, generate_content_output({"clear": True, "resolved": False})),
+        ])
+        assessor = GeminiIntakeAssessment(session, "key")
+
+        result = await assessor.assess("Please help.", autoreply_sent=False)
+
+        self.assertTrue(result["clear"])
+        self.assertFalse(result["resolved"])
+        self.assertEqual(assessor.last_outcome, "assessed")
+        self.assertEqual(session.calls, 3)
+
+    @patch("core.ai_reviewer.asyncio.sleep", new_callable=AsyncMock)
+    async def test_intake_cancellation_is_not_retried(self, sleep):
+        session = FakeSession(FakeResponse(200, asyncio.CancelledError()))
+        assessor = GeminiIntakeAssessment(session, "key")
+        with self.assertRaises(asyncio.CancelledError):
+            await assessor.assess("Please help.", autoreply_sent=False)
+        self.assertEqual(session.calls, 1)
+        sleep.assert_not_awaited()
+
+    @patch("core.ai_reviewer.asyncio.sleep", new_callable=AsyncMock)
+    async def test_intake_assessment_retries_invalid_json_and_tolerates_optional_omissions(self, sleep):
+        session = FakeSession(
+            [
+                FakeResponse(200, generate_content_output("{not valid json")),
+                FakeResponse(
+                    200,
+                    generate_content_output(
+                        {
+                            "clear": True,
+                            "resolved": False,
+                            "selected_autoreply": "payment timing",
+                        }
+                    ),
+                ),
+            ]
+        )
+        assessor = GeminiIntakeAssessment(session, "key")
+
+        result = await assessor.assess(
+            "When will payment arrive?",
+            autoreply_sent=False,
+            autoreply_catalog={"Payment Timing": "payment"},
+        )
+
+        self.assertIsNotNone(result)
+        self.assertEqual(session.calls, 2)
+        self.assertEqual(result["selected_autoreply"], "Payment Timing")
+        self.assertEqual(result["remaining_inquiries"], [])
+        self.assertEqual(result["form_fills"], {})
+
+    async def test_intake_assessment_unknown_alias_safely_becomes_no_match(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output(
+                    {
+                        "clear": True,
+                        "resolved": False,
+                        "remaining_inquiries": ["staff review"],
+                        "clarification_question": "",
+                        "ticket_summary": "A request needs staff review.",
+                        "primary_question": "Can staff review this?",
+                        "selected_autoreply": "invented alias",
+                        "form_fills": [],
+                    }
+                ),
+            )
+        )
+        assessor = GeminiIntakeAssessment(session, "key")
+
+        result = await assessor.assess("Please review this.", autoreply_sent=False)
+
+        self.assertIsNotNone(result)
+        self.assertIsNone(result["selected_autoreply"])
+
+    async def test_flight_log_confirmation_classifier_returns_structured_decision(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"decision": "yes"}))
+        )
+        classifier = GeminiFlightLogConfirmationClassifier(
+            session, "key", model="gemini-3.5-flash-lite"
+        )
+
+        decision = await classifier.classify_confirmation(
+            "Yes, my flight still is not visible after 24 hours."
+        )
+
+        self.assertEqual(decision, "yes")
+        self.assertEqual(classifier.last_outcome, "classified")
+        config = session.request[1]["json"]["generationConfig"]
+        self.assertEqual(config["responseSchema"]["properties"]["decision"]["enum"], [
+            "yes", "close", "new_inquiry"
+        ])
+
+    async def test_flight_log_confirmation_classifier_fails_safe_to_new_inquiry(self):
+        classifier = GeminiFlightLogConfirmationClassifier(
+            FakeSession(FakeResponse(500, {})), "key"
+        )
+
+        decision = await classifier.classify_confirmation("Help with something else")
+
+        self.assertEqual(decision, "new_inquiry")
+
+    def test_decodes_utf8_text_attachment_for_aireply(self):
+        self.assertEqual(
+            decode_ai_text_attachment("context.TXT", b"Useful context \xe2\x9c\x93"),
+            "Useful context ✓",
+        )
+        self.assertEqual(
+            decode_ai_text_attachment("knowledge.MD", b"# Knowledge\nUse route A."),
+            "# Knowledge\nUse route A.",
+        )
+        self.assertEqual(
+            decode_ai_text_attachment("knowledge.markdown", b"Canonical context"),
+            "Canonical context",
+        )
+        with self.assertRaises(ValueError):
+            decode_ai_text_attachment("context.pdf", b"not text")
+        with self.assertRaises(ValueError):
+            decode_ai_text_attachment("context.txt", b"\xff")
+
+    def test_aihi_has_four_complete_premade_disclosures(self):
+        self.assertEqual(AI_HELLO_FOOTER, AI_REPLY_FOOTER)
+        self.assertEqual(AI_REPLY_FOOTER, "This reply is AI Generated")
+        self.assertEqual(len(AI_HELLO_MESSAGES), 4)
+        self.assertEqual(len(set(AI_HELLO_MESSAGES)), 4)
+        for message in AI_HELLO_MESSAGES:
+            normalized = message.casefold()
+            self.assertIn("full", normalized)
+            self.assertIn("inquiry", normalized)
+            self.assertIn("direct", normalized)
+            self.assertIn("relevant team", normalized)
+            self.assertIn("how can i help you today?", normalized)
+            self.assertNotIn("human", normalized)
+            self.assertNotIn("real agent", normalized)
+
+    def test_ai_reply_layout_removes_rich_text_space_entities(self):
+        response = (
+            "Our team will assess the suggestion.&#x20;\n\n"
+            "Please allow some time for the team to review it. &#x20;"
+        )
+
+        self.assertEqual(
+            normalize_generated_reply_layout(response),
+            "Our team will assess the suggestion.\n\n"
+            "Please allow some time for the team to review it.",
+        )
+
+    def test_extracts_generated_discord_command_references(self):
+        self.assertEqual(
+            find_command_references("Use ?apply or ?ApplyStatus, but why?"),
+            {"apply", "applystatus"},
+        )
+
+    def test_resolves_distinct_durable_autoreply_types(self):
+        self.assertEqual(resolve_ai_autoreply_type("Application Help"), "application help")
+        self.assertEqual(
+            resolve_ai_autoreply_type(
+                "Application Help",
+                {"alias": "  APPLY-ALIAS  "},
+            ),
+            "apply-alias",
+        )
+
+    def test_department_transfer_requires_explicit_change_intent(self):
+        self.assertFalse(has_department_transfer_intent("What department would be acceptable?"))
+        self.assertFalse(has_department_transfer_intent("Which departments are available?"))
+        self.assertTrue(has_department_transfer_intent("I want to change my department."))
+        self.assertTrue(has_department_transfer_intent("Can I transfer departments?"))
+        self.assertTrue(
+            has_department_transfer_intent(
+                "I want to change my dept from Ramp Agent to Ground Crew."
+            )
+        )
+        self.assertFalse(
+            has_department_transfer_intent(
+                "Can you transfer this ticket to another support department?"
+            )
+        )
+        self.assertTrue(
+            is_ticket_routing_request(
+                "Can you transfer this ticket to another support department?"
+            )
+        )
+
+    async def test_ticket_routing_cannot_select_personal_department_transfer(self):
+        selection_name = "I wish to CHANGE DEPARTMENT"
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": selection_name}))
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "Can you transfer this ticket to another support department?",
+            {selection_name: "Department Transfer | TUI Airways"},
+            context_messages=[
+                {
+                    "speaker": "recipient",
+                    "message": "I previously asked about transferring departments.",
+                }
+            ],
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(reviewer.last_outcome, "no_match")
+        self.assertEqual(session.calls, 0)
+
+    async def test_ambiguous_department_question_cannot_select_transfer_template(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output(
+                    {"autoreply_key": "I wish to CHANGE DEPARTMENT"}
+                ),
+            )
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "What department would be acceptable?",
+            {
+                "I wish to CHANGE DEPARTMENT": (
+                    "Department Transfer | TUI Airways\n"
+                    "Thank you for expressing an interest in changing your current department."
+                )
+            },
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(reviewer.last_outcome, "no_match")
+        self.assertEqual(session.calls, 0)
+
+    def test_builds_complete_autoreply_context_including_staff_ai_and_actions(self):
+        log_messages = [
+            {
+                "message_id": str(index),
+                "author": {"id": str(index), "mod": index % 2 == 0},
+                "type": "thread_message",
+                "content": f"Conversation message {index}",
+            }
+            for index in range(1, 13)
+        ]
+        log_messages.extend(
+            [
+                {
+                    "message_id": "13",
+                    "author": {"id": "999", "mod": True},
+                    "type": "thread_message",
+                    "content": "Bot or AI output",
+                },
+                {
+                    "message_id": "14",
+                    "author": {"id": "22", "mod": True},
+                    "type": "internal",
+                    "content": "Private staff note",
+                },
+                {
+                    "message_id": "15",
+                    "author": {"id": "10", "mod": False},
+                    "type": "thread_message",
+                    "content": "Current recipient message",
+                },
+                {
+                    "message_id": "16",
+                    "author": {"id": "22", "mod": True},
+                    "type": "ai_feed",
+                    "content": "Route suggestions to the development team.",
+                },
+            ]
+        )
+
+        context = build_autoreply_context(
+            log_messages,
+            current_message_id=15,
+            bot_user_id=999,
+        )
+
+        self.assertEqual(len(context), 15)
+        self.assertEqual(context[0]["message"], "Conversation message 1")
+        self.assertEqual(
+            context[-1]["message"], "Route suggestions to the development team."
+        )
+        self.assertEqual(context[1]["speaker"], "human_staff")
+        self.assertEqual(context[-3]["speaker"], "ai_or_bot_reply")
+        self.assertEqual(context[-2]["speaker"], "staff_context_or_action")
+        self.assertEqual(context[-1]["speaker"], "trusted_ai_feed")
+        self.assertIn("Bot or AI output", str(context))
+        self.assertNotIn("Current recipient message", str(context))
+
+    def test_manual_ai_transcript_uses_only_recipient_and_relayed_human_messages(self):
+        transcript, count = build_relayed_reply_transcript(
+            [
+                {
+                    "timestamp": "2026-07-17T10:00:00+00:00",
+                    "author": {"id": "100", "mod": False},
+                    "type": "thread_message",
+                    "content": "Can I apply from mobile?",
+                    "attachments": [],
+                },
+                {
+                    "timestamp": "2026-07-17T10:01:00+00:00",
+                    "author": {"id": "200", "mod": True},
+                    "type": "thread_message",
+                    "content": "Staff roles require a PC.",
+                    "attachments": [{"filename": "requirements.txt"}],
+                },
+                {
+                    "author": {"id": "999", "mod": True},
+                    "type": "thread_message",
+                    "content": "[AI autoreply: Helpful]\nPrevious AI-generated reply",
+                },
+                {
+                    "author": {"id": "200", "mod": True},
+                    "type": "note",
+                    "content": "Private staff discussion",
+                },
+                {
+                    "author": {"id": "200", "mod": True},
+                    "type": "anonymous",
+                    "content": "This was also relayed to the recipient.",
+                },
+            ],
+            bot_user_id=999,
+        )
+
+        self.assertEqual(count, 4)
+        self.assertIn("] RECIPIENT MESSAGE\nCan I apply from mobile?", transcript)
+        self.assertIn("] STAFF-SENT MESSAGE\nStaff roles require a PC.", transcript)
+        self.assertIn("Attachments: requirements.txt", transcript)
+        self.assertIn("[STAFF-SENT MESSAGE]\nThis was also relayed to the recipient.", transcript)
+        self.assertIn("[AI-SENT MESSAGE]\n[AI autoreply: Helpful]", transcript)
+        self.assertIn("Previous AI-generated reply", transcript)
+        self.assertNotIn("Private staff discussion", transcript)
+
+    def test_latest_relayed_human_author_controls_aiall_skip(self):
+        messages = [
+            {
+                "author": {"id": "100", "mod": False},
+                "type": "thread_message",
+                "content": "Recipient question",
+            },
+            {
+                "author": {"id": "999", "mod": True},
+                "type": "thread_message",
+                "content": "Automated bot reply",
+            },
+            {
+                "author": {"id": "200", "mod": True},
+                "type": "note",
+                "content": "Private note",
+            },
+            {
+                "author": {"id": "200", "mod": True},
+                "type": "anonymous",
+                "content": "Human staff answer",
+            },
+        ]
+
+        self.assertTrue(last_relayed_message_is_human_staff(messages, bot_user_id=999))
+        messages.append(
+            {
+                "author": {"id": "100", "mod": False},
+                "type": "thread_message",
+                "content": "Recipient follow-up",
+            }
+        )
+        self.assertFalse(last_relayed_message_is_human_staff(messages, bot_user_id=999))
+        self.assertIsNone(last_relayed_message_is_human_staff([], bot_user_id=999))
+
+    def test_aireply_argument_supports_optional_context_and_raw_context(self):
+        self.assertEqual(parse_aireply_argument(""), (False, ""))
+        self.assertEqual(
+            parse_aireply_argument("they need to be on pc"),
+            (False, "they need to be on pc"),
+        )
+        self.assertEqual(
+            parse_aireply_argument("RAW they need to be on pc"),
+            (True, "they need to be on pc"),
+        )
+
+    async def test_prior_recipient_and_staff_messages_are_context_only(self):
+        selection_name = "I wish to CHANGE DEPARTMENT"
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": selection_name}))
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "What department would be acceptable?",
+            {selection_name: "Department Transfer | TUI Airways"},
+            context_messages=[
+                {
+                    "speaker": "recipient",
+                    "message": "I would like to transfer departments.",
+                },
+                {
+                    "speaker": "human_staff",
+                    "message": "Which department are you considering?",
+                },
+            ],
+        )
+
+        self.assertEqual(selected, selection_name)
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("prior_context_only", prompt)
+        self.assertIn("CONTEXT ONLY", prompt)
+        self.assertIn("A human staff message is not recipient intent", prompt)
+        self.assertIn("Which department are you considering?", prompt)
+
+    async def test_alias_name_and_reply_sanity_are_sent_to_gemini(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": "Application help"}))
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "How do I apply?",
+            {"Application help": "Please use the application form."},
+            alias_names={"Application help": "apply-help"},
+        )
+
+        self.assertEqual(selected, "Application help")
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn('"alias": "apply-help"', prompt)
+        self.assertIn("what the recipient is actually asking", prompt)
+        self.assertIn("confusing, nonsensical in context", prompt)
+        self.assertIn("Useful extra context is allowed", prompt)
+
+    async def test_department_change_cannot_select_sub_certification(self):
+        department_reply = "Please complete this department transfer form."
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": "Department change"}))
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "I want to change my dept from Ramp Agent to Ground Crew.",
+            {
+                "Department change": department_reply,
+                "SUB CERTIFICATION REQUEST": (
+                    "Please fill in your MAIN DEPARTMENT and DESIRED SUB DEPARTMENT."
+                ),
+            },
+        )
+
+        self.assertEqual(selected, "Department change")
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn(department_reply, prompt)
+        self.assertNotIn("DESIRED SUB DEPARTMENT", prompt)
+
+    async def test_staff_context_alone_cannot_supply_department_transfer_intent(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output(
+                    {"autoreply_key": "I wish to CHANGE DEPARTMENT"}
+                ),
+            )
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "What department would be acceptable?",
+            {"I wish to CHANGE DEPARTMENT": "Department Transfer | TUI Airways"},
+            context_messages=[
+                {
+                    "speaker": "human_staff",
+                    "message": "You can transfer departments if needed.",
+                }
+            ],
+        )
+
+        self.assertIsNone(selected)
+        self.assertEqual(session.calls, 0)
+
+    def test_roblox_game_pass_url_matches_anywhere_in_message(self):
+        self.assertTrue(
+            has_roblox_game_pass_url(
+                "Here it is: https://www.roblox.com/game-pass/12345/example please check it"
+            )
+        )
+        self.assertTrue(
+            has_roblox_game_pass_url("<HTTPS://WWW.ROBLOX.COM/GAME-PASS/12345>")
+        )
+        self.assertTrue(
+            has_roblox_game_pass_url("https://roblox.com/game-pass/12345/example")
+        )
+        self.assertTrue(
+            has_roblox_game_pass_url("http://roblox.com/game-pass/12345/example")
+        )
+        self.assertFalse(has_roblox_game_pass_url("https://www.roblox.com/games/12345"))
+        self.assertIn("**published**", ROBLOX_GAME_PASS_AUTOREPLY)
+        self.assertIn("**Maturity Questionnaire**", ROBLOX_GAME_PASS_AUTOREPLY)
+
+    def test_generated_ai_reply_can_omit_standard_closing(self):
+        self.assertEqual(
+            finalize_generated_ai_reply("Helpful answer", include_closing=False),
+            "Helpful answer",
+        )
+        self.assertEqual(
+            finalize_generated_ai_reply("Helpful answer"),
+            "Helpful answer\n\nCan I help with anything else?",
+        )
+
+    def test_all_inquiries_reply_uses_fixed_closure_warning(self):
+        self.assertEqual(
+            finalize_generated_ai_reply("Ticket summary.", closing_text=AI_ALL_CLOSING),
+            f"Ticket summary.\n\n{AI_ALL_CLOSING}",
+        )
+
+    def test_all_inquiries_reply_can_use_only_fixed_closure_warning(self):
+        self.assertEqual(
+            finalize_generated_ai_reply("", closing_text=AI_ALL_CLOSING),
+            AI_ALL_CLOSING,
+        )
+
+    def test_ai_reply_converts_literal_newline_escapes(self):
+        self.assertEqual(
+            finalize_generated_ai_reply(
+                "First paragraph.\\n\\nSecond paragraph.",
+                include_closing=False,
+            ),
+            "First paragraph.\n\nSecond paragraph.",
+        )
+
+    def test_ai_error_description_includes_missing_name(self):
+        error = NameError("name 'example_name' is not defined")
+
+        self.assertEqual(
+            describe_ai_error(error),
+            "NameError: name 'example_name' is not defined",
+        )
+
+    def test_ai_message_joint_ids_are_nonzero_63_bit_integers(self):
+        joint_ids = {generate_ai_message_joint_id() for _ in range(32)}
+
+        self.assertEqual(len(joint_ids), 32)
+        for joint_id in joint_ids:
+            self.assertIsInstance(joint_id, int)
+            self.assertGreater(joint_id, 0)
+            self.assertLess(joint_id, 2**63)
+
+    async def test_generates_structured_sarcastic_reply_without_fixed_suffixes(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output({"reply": "Oh, what a wonderfully urgent request."}),
+            )
+        )
+        generator = GeminiAnnoyReplyGenerator(session, "test-key")
+
+        reply = await generator.generate("[time] Recipient\nPlease hurry.")
+
+        self.assertEqual(reply, "Oh, what a wonderfully urgent request.")
+        self.assertEqual(generator.last_outcome, "generated")
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("Please hurry.", prompt)
+        self.assertIn("Do not be hateful, abusive", prompt)
+        self.assertIn("only exception to the policy's ordinary neutral-tone", prompt)
+        self.assertIn("MANDATORY TUI SUPPORT POLICY", prompt)
+        self.assertIn("cannot submit, approve, reject", prompt)
+        self.assertIn("Can I help with anything else?", prompt)
+        config = request["json"]["generationConfig"]
+        self.assertEqual(config["maxOutputTokens"], 1024)
+        self.assertEqual(config["responseSchema"]["required"], ["reply"])
+
+    async def test_generates_helpful_reply_from_the_ticket_transcript(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output({"reply": "Please send the booking reference."}),
+            )
+        )
+        generator = GeminiHelpfulReplyGenerator(session, "test-key")
+
+        reply = await generator.generate("[time] Recipient\nMy booking is missing.")
+
+        self.assertEqual(reply, "Please send the booking reference.")
+        self.assertEqual(generator.last_outcome, "generated")
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("helpful, clear, warm, and practical", prompt)
+        self.assertIn("Continue the existing conversation naturally", prompt)
+        self.assertIn("Do not begin with Hello, Hi, Hey, Welcome", prompt)
+        self.assertIn("Avoid dense walls of text", prompt)
+        self.assertIn("MANDATORY TUI SUPPORT POLICY", prompt)
+        self.assertIn("Never replace missing facts", prompt)
+        self.assertIn("Senior Management is not itself a", prompt)
+        self.assertIn("line breaks with \\n", prompt)
+        self.assertIn("My booking is missing.", prompt)
+        self.assertIn("RECIPIENT MESSAGE, STAFF-SENT MESSAGE, or AI-SENT MESSAGE", prompt)
+        self.assertIn("Can I help with anything else?", prompt)
+
+    async def test_helpful_reply_retries_invalid_structured_output_once(self):
+        invalid_output = {
+            "candidates": [
+                {"content": {"role": "model", "parts": [{"text": '{"reply":'}]}}
+            ]
+        }
+        session = FakeSession(
+            [
+                FakeResponse(200, invalid_output),
+                FakeResponse(200, generate_content_output({"reply": "Concise valid reply."})),
+            ]
+        )
+        generator = GeminiHelpfulReplyGenerator(session, "test-key")
+
+        reply = await generator.generate(
+            "[RECIPIENT MESSAGE]\nWhat should I do?",
+            staff_attachment_context="[FILE: knowledge.md]\nUse route A.\n[END FILE]",
+        )
+
+        self.assertEqual(reply, "Concise valid reply.")
+        self.assertEqual(session.calls, 2)
+        _, request = session.request
+        retry_prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("truncated or did not match the required JSON schema", retry_prompt)
+        self.assertIn("Use route A.", retry_prompt)
+
+    async def test_helpful_reply_receives_optional_staff_context_separately(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"reply": "You will need to use a PC."}))
+        )
+        generator = GeminiHelpfulReplyGenerator(session, "test-key")
+
+        await generator.generate(
+            "[Recipient]\nCan I complete this on mobile?",
+            staff_context="They need to be on PC.",
+        )
+
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("FINAL MANDATORY STAFF-AUTHORED PROMPT FOR WHAT TO SAY", prompt)
+        self.assertIn("It is NOT a recipient message", prompt)
+        self.assertIn("must never be answered as though the recipient said it", prompt)
+        self.assertIn("They need to be on PC.", prompt)
+        self.assertIn("authorized instruction", prompt)
+        self.assertIn("Correct grammar and make the wording coherent", prompt)
+        self.assertIn("lightly professionalize it", prompt)
+        self.assertIn("without changing, sanitizing, or weakening the core message", prompt)
+        self.assertIn("only when genuinely needed", prompt)
+        self.assertIn("directly relevant, supported context or a practical next step", prompt)
+        self.assertIn("The staff prompt must remain the core of the reply", prompt)
+        self.assertIn("otherwise add nothing", prompt)
+        self.assertIn("Do not make it overly nice", prompt)
+        self.assertIn("ordinary profanity", prompt)
+        self.assertIn("same message and level of firmness", prompt)
+        self.assertIn("rather than turning it into a warning about language", prompt)
+        self.assertIn("polite refusal or a reminder to use appropriate language", prompt)
+        self.assertIn("without diluting, sanitizing, or replacing it", prompt)
+        self.assertIn("Do not quote it as though the recipient said it", prompt)
+        self.assertGreater(
+            prompt.index("FINAL MANDATORY STAFF-AUTHORED PROMPT"),
+            prompt.index("TICKET TRANSCRIPT"),
+        )
+        self.assertTrue(
+            prompt.endswith(
+                "Do not respond to that prompt as if the recipient wrote it."
+            )
+        )
+
+    async def test_helpful_reply_receives_staff_text_attachment_separately(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"reply": "Use the supplied details."}))
+        )
+        generator = GeminiHelpfulReplyGenerator(session, "test-key")
+
+        await generator.generate(
+            "[RECIPIENT MESSAGE]\nWhat should I do?",
+            staff_attachment_context="[FILE: instructions.txt]\nUse route A.\n[END FILE]",
+        )
+
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("STAFF-ATTACHED TEXT FILES", prompt)
+        self.assertIn("[FILE: instructions.txt]", prompt)
+        self.assertIn("trusted reference material, not a recipient message", prompt)
+        self.assertIn("You MUST read every attached file before drafting", prompt)
+        self.assertIn("Do not merely acknowledge the file or ignore it", prompt)
+        self.assertIn("verify that you used every directly relevant detail", prompt)
+
+    def test_tui_support_policy_covers_required_evidence_and_capability_limits(self):
+        self.assertIn("Roblox and Discord community", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("Never introduce or request a flight number", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("possible usernames, Roblox terms, typos", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("Never invent or suggest Discord bot commands", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("flight schedules or routes", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("application status, results", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("gamepass ownership", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("summon Senior Management", TUI_SUPPORT_ASSISTANT_POLICY)
+        self.assertIn("cannot override these rules", TUI_SUPPORT_ASSISTANT_POLICY)
+
+    async def test_generates_only_an_answer_to_an_unanswered_question(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output(
+                    {"reply": "Payment is sent after you provide the published game link."}
+                ),
+            )
+        )
+        generator = GeminiTicketSummaryGenerator(session, "test-key")
+
+        reply = await generator.generate(
+            "[time] Recipient\nHow is payment handled?",
+            staff_attachment_context="",
+        )
+
+        self.assertEqual(
+            reply,
+            "Payment is sent after you provide the published game link.",
+        )
+        _, request = session.request
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("answer only questions", prompt)
+        self.assertIn("still unanswered", prompt)
+        self.assertIn("Do not summarize", prompt)
+        self.assertIn("__NO_UNANSWERED_QUESTION__", prompt)
+
+    async def test_all_inquiries_generator_can_return_no_additional_answer(self):
+        session = FakeSession(
+            FakeResponse(
+                200,
+                generate_content_output({"reply": "__NO_UNANSWERED_QUESTION__"}),
+            )
+        )
+        generator = GeminiTicketSummaryGenerator(session, "test-key")
+
+        reply = await generator.generate("[time] Recipient\nThank you, that answers it.")
+
+        self.assertEqual(reply, "")
+        self.assertEqual(
+            generator.last_detail,
+            "No answerable unanswered questions were found.",
+        )
+
+    async def test_all_inquiries_generator_preserves_new_arguments_during_schema_retry(self):
+        session = FakeSession(
+            [
+                FakeResponse(200, {"candidates": []}),
+                FakeResponse(
+                    200,
+                    generate_content_output({"reply": "__NO_UNANSWERED_QUESTION__"}),
+                ),
+            ]
+        )
+        generator = GeminiTicketSummaryGenerator(session, "test-key")
+
+        reply = await generator.generate(
+            "[time] Recipient\nThank you, that answers it.",
+            staff_context="",
+            staff_attachment_context="",
+        )
+
+        self.assertEqual(reply, "")
+        self.assertEqual(session.calls, 2)
+
+    async def test_returns_only_a_configured_match(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": "apply"}))
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify(
+            "How do I apply?",
+            {"apply": "Use the application form.", "refund": "Request a refund here."},
+            selection_guidance={
+                "apply": "Select only for staff employment applications."
+            },
+        )
+
+        self.assertEqual(selected, "apply")
+        self.assertEqual(reviewer.last_outcome, "matched")
+        self.assertEqual(reviewer.last_detail, "Selected autoreply: apply.")
+        url, request = session.request
+        self.assertEqual(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-3.5-flash-lite:generateContent",
+        )
+        generation_config = request["json"]["generationConfig"]
+        prompt = request["json"]["contents"][0]["parts"][0]["text"]
+        self.assertIn("A shared topic word is never sufficient evidence", prompt)
+        self.assertIn("What department would be acceptable?", prompt)
+        self.assertIn("trusted `additional_info`", prompt)
+        self.assertIn("Select only for staff employment applications.", prompt)
+        self.assertEqual(generation_config["thinkingConfig"]["thinkingLevel"], "minimal")
+        self.assertEqual(generation_config["maxOutputTokens"], 256)
+        self.assertEqual(generation_config["responseMimeType"], "application/json")
+        self.assertEqual(
+            generation_config["responseSchema"]["properties"]["autoreply_key"]["enum"],
+            ["__NO_MATCH__", "apply", "refund"],
+        )
+        self.assertEqual(request["headers"]["x-goog-api-key"], "test-key")
+
+    async def test_2_5_flash_lite_omits_unsupported_thinking_level(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": "__NO_MATCH__"}))
+        )
+        reviewer = GeminiAutoReplyReviewer(
+            session, "test-key", model="models/gemini-2.5-flash-lite"
+        )
+
+        await reviewer.classify("A question", {"apply": "Apply here."})
+
+        url, request = session.request
+        self.assertEqual(
+            url,
+            "https://generativelanguage.googleapis.com/v1beta/models/"
+            "gemini-2.5-flash-lite:generateContent",
+        )
+        self.assertNotIn("thinkingConfig", request["json"]["generationConfig"])
+
+    async def test_no_match_returns_none(self):
+        session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": "__NO_MATCH__"}))
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "test-key")
+
+        selected = await reviewer.classify("Unrelated question", {"apply": "Apply here."})
+
+        self.assertIsNone(selected)
+        self.assertEqual(reviewer.last_outcome, "no_match")
+
+    async def test_unknown_or_invalid_output_fails_closed(self):
+        unknown_session = FakeSession(
+            FakeResponse(200, generate_content_output({"autoreply_key": "invented"}))
+        )
+        invalid_session = FakeSession(
+            FakeResponse(
+                200,
+                {"candidates": [{"content": {"parts": [{"text": "?"}]}}]},
+            )
+        )
+
+        self.assertIsNone(
+            await GeminiAutoReplyReviewer(unknown_session, "key").classify(
+                "Question", {"apply": "Apply here."}
+            )
+        )
+        self.assertIsNone(
+            await GeminiAutoReplyReviewer(invalid_session, "key").classify(
+                "Question", {"apply": "Apply here."}
+            )
+        )
+
+    async def test_http_failure_falls_back(self):
+        reviewer = GeminiAutoReplyReviewer(FakeSession(FakeResponse(429, {})), "key")
+
+        self.assertIsNone(await reviewer.classify("How do I apply?", {"apply": "Apply here."}))
+        self.assertEqual(reviewer.last_outcome, "http_error")
+        self.assertEqual(reviewer.last_detail, "Gemini returned HTTP 429.")
+
+    async def test_transient_server_error_retries_once(self):
+        session = FakeSession(
+            [
+                FakeResponse(500, {}),
+                FakeResponse(200, generate_content_output({"autoreply_key": "apply"})),
+            ]
+        )
+        reviewer = GeminiAutoReplyReviewer(session, "key")
+
+        selected = await reviewer.classify("How do I apply?", {"apply": "Apply here."})
+
+        self.assertEqual(selected, "apply")
+        self.assertEqual(session.calls, 2)
+        self.assertEqual(reviewer.last_outcome, "matched")
+
+    def test_build_ticket_text_includes_attachment_names_and_truncates(self):
+        message = SimpleNamespace(
+            content="Please review this",
+            attachments=[SimpleNamespace(filename="application.pdf")],
+        )
+
+        self.assertEqual(
+            build_ticket_text(message),
+            "Please review this\n\nAttachments: application.pdf",
+        )
+        self.assertEqual(build_ticket_text(message, max_chars=6), "Please")
+
+    def test_application_trigger_covers_common_wording_and_typos(self):
+        examples = (
+            "Hello! How can I apply?",
+            "Where is the application form?",
+            "I am apllying for cabin crew",
+            "Are you recruiting pilots?",
+            "Do you have any vacancies?",
+            "I want to join the TUI team",
+            "Could I work for the airline?",
+            "I would love to be cabin crew",
+            "Are there any careers or jobs available?",
+            "Where should I send my CV?",
+            "How do I register for a staff position?",
+        )
+
+        for text in examples:
+            with self.subTest(text=text):
+                self.assertTrue(has_application_trigger(text))
+
+        self.assertFalse(has_application_trigger("My apple juice is missing."))
+        self.assertFalse(has_application_trigger("When does flight 123 depart?"))
+        self.assertTrue(
+            has_configured_trigger(
+                "I would like to become cabin crew.",
+                ["apply", "become", "staff"],
+            )
+        )
+        self.assertFalse(has_configured_trigger("The staffing level is fine.", ["staff"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

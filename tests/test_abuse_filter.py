@@ -1,0 +1,87 @@
+import unittest
+
+from core.abuse_filter import (
+    ABUSE_AUTO_CLOSE_MESSAGE,
+    contains_abusive_language,
+    normalize_custom_abuse_term,
+)
+
+
+class AbuseFilterTests(unittest.TestCase):
+    def test_detects_configured_term_and_severe_abuse(self):
+        abusive_messages = (
+            "You are a goon.",
+            "What a g00n",
+            "f@gg0t",
+            "retards",
+            "go fuck yourself",
+            "K.Y.S",
+        )
+
+        for message in abusive_messages:
+            with self.subTest(message=message):
+                self.assertTrue(contains_abusive_language(message))
+
+    def test_n_word_family_is_not_a_built_in_trigger(self):
+        acceptable_messages = (
+            "the n-word",
+            "the n words",
+            "n.i.g.g.e.r",
+            "nigggger",
+            "nigga",
+            "niggas",
+        )
+
+        for message in acceptable_messages:
+            with self.subTest(message=message):
+                self.assertFalse(contains_abusive_language(message))
+
+    def test_uses_whole_words_to_avoid_embedded_fragment_matches(self):
+        acceptable_messages = (
+            "The lagoon looks nice.",
+            "Can I go on the game?",
+            "Please add more spacing.",
+            "This process is retarding progress.",
+            "I have five working days.",
+        )
+
+        for message in acceptable_messages:
+            with self.subTest(message=message):
+                self.assertFalse(contains_abusive_language(message))
+
+    def test_warning_is_the_approved_auto_close_message(self):
+        self.assertEqual(
+            ABUSE_AUTO_CLOSE_MESSAGE,
+            "Unfortunately, we do not tolerate abuse directed towards our staff team. This ticket "
+            "has now been automatically closed.\n\n"
+            "You may open a new ticket if you still require assistance. However, any further "
+            "abusive behaviour will result in you being blocked from contacting support.",
+        )
+
+    def test_normalizes_and_matches_administrator_added_words_and_phrases(self):
+        self.assertEqual(normalize_custom_abuse_term('  "Bad-Phrase!"  '), "bad phrase")
+        self.assertTrue(
+            contains_abusive_language(
+                "That was a b@d---phr@se.",
+                extra_terms=["bad phrase"],
+            )
+        )
+        self.assertTrue(
+            contains_abusive_language("CUSTOMWORD", extra_terms=["customword"])
+        )
+        self.assertFalse(
+            contains_abusive_language("custom wording", extra_terms=["customword"])
+        )
+
+    def test_custom_term_does_not_treat_faq_as_obfuscated_abuse(self):
+        message = (
+            "Why is the Career FAQ document locked, and are we allowed to have multiple "
+            "careers at once?"
+        )
+
+        self.assertFalse(contains_abusive_language(message, extra_terms=["fag"]))
+        self.assertTrue(contains_abusive_language("f@g", extra_terms=["fag"]))
+
+
+if __name__ == "__main__":
+    unittest.main()

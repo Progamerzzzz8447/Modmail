@@ -3,11 +3,13 @@ import copy
 import base64
 import functools
 import io
+import os
 import re
 import time
 import traceback
 import typing
 import warnings
+from collections.abc import Mapping
 from datetime import timedelta, datetime, timezone
 from types import SimpleNamespace
 
@@ -16,11 +18,48 @@ import isodate
 import discord
 from discord.ext import commands
 from discord.ext.commands import MissingRequiredArgument, CommandError
+from discord.ext.commands.view import StringView
 from lottie.importers import importers as l_importers
 from lottie.exporters import exporters as l_exporters
 
+from core.abuse_filter import ABUSE_AUTO_CLOSE_MESSAGE, contains_abusive_language
+from core.ai_reviewer import (
+    AI_ALL_CLOSING,
+    AI_HELLO_FOOTER,
+    AI_REPLY_FOOTER,
+    AI_INTAKE_GREETING,
+    AI_INTAKE_HANDOFF,
+    AI_INTAKE_MAX_QUESTIONS,
+    AI_TICKET_CLOSED_MESSAGE,
+    ROBLOX_GAME_PASS_AUTOREPLY,
+    GeminiAutoReplyReviewer,
+    GeminiFormAutofill,
+    GeminiFlightLogConfirmationClassifier,
+    GeminiIntakeAssessment,
+    apply_form_autofills,
+    build_autoreply_context,
+    count_logged_intake_questions,
+    build_ticket_text,
+    describe_ai_error,
+    extract_blank_form_fields,
+    enforce_recipient_discord_username,
+    generate_ai_message_joint_id,
+    has_application_trigger,
+    has_configured_trigger,
+    has_roblox_game_pass_url,
+    is_acknowledgement_only,
+    normalize_generated_reply_layout,
+    recipient_username_form_fills,
+    resolve_ai_autoreply_type,
+)
+from core.alias_parser import (
+    FORMATTED_AI_REPLY_COMMANDS,
+    SAFE_AI_REPLY_COMMANDS,
+    parse_alias,
+    parse_reply_alias,
+)
 from core.models import DMDisabled, DummyMessage, PermissionLevel, getLogger
-from core.ticket_opened_v2 import send_ticket_opened
+from core.subscriptions import author_has_thread_subscription
 from core import checks
 from core.utils import (
     is_image_url,
@@ -39,6 +78,79 @@ from core.utils import (
 )
 
 logger = getLogger(__name__)
+AI_INTAKE_MODEL = "gemini-3.5-flash-lite"
+RESOLVED_CATEGORY_ID = 1369044841366814871
+SUBQUAL_GUILD_ID = 1335548232301809704
+SUBQUAL_REQUIRED_DAYS = 14
+SUBQUAL_ACADEMY_GUILD_ID = 1393691971612184658
+SUBQUAL_TRAINEE_URL = "https://obcdtximizxmjftbjyop.supabase.co/functions/v1/internal-trainee"
+SUBQUAL_POSITIONS = {
+    "cabin crew": "cabin-crew",
+    "cabin-crew": "cabin-crew",
+    "flight deck": "flight-deck",
+    "flight-deck": "flight-deck",
+    "ground ops": "ground-ops",
+    "ground operations": "ground-ops",
+    "ground-ops": "ground-ops",
+    "passenger services": "passenger-services",
+    "passenger service": "passenger-services",
+    "passenger-services": "passenger-services",
+}
+AI_HANDOFF_TEAMS = {
+    "Senior Management": {
+        "role_id": 1531741911784624238,
+        "guidance": (
+            "Only genuinely severe or high-risk matters, safeguarding concerns, credible "
+            "threats, major security incidents, or serious escalations with broad impact."
+        ),
+    },
+    "Public Relations": {
+        "role_id": 1448398968634740736,
+        "guidance": "Partnerships, media, events, brand, publicity, and public communications.",
+    },
+    "General Support Staff": {
+        "role_id": 1368713588252082306,
+        "guidance": "General support and the fallback when no specialist team clearly fits.",
+    },
+    "Training & Recruitment": {
+        "role_id": 1442572282475315321,
+        "guidance": (
+            "Applications, recruitment, careers, training, practicals, qualifications, and "
+            "application outcomes."
+        ),
+    },
+    "Absence Manager": {
+        "role_id": 1529615997823352862,
+        "guidance": "All leave-of-absence, LOA, absence, and return-from-leave matters.",
+    },
+    "Heads of Departments": {
+        "role_id": 1423554342170001489,
+        "guidance": (
+            "Department-specific operations, leadership decisions, departmental transfers, "
+            "and matters requiring a department head."
+        ),
+    },
+    "Human Resources": {
+        "role_id": 1442902654035562571,
+        "guidance": (
+            "Staff conduct, disciplinary action or appeals, workplace disputes, staff welfare, "
+            "and internal people matters."
+        ),
+    },
+}
+
+
+def is_greeting_only_intake(value: str) -> bool:
+    """Return whether an opening contains only greetings or light pleasantries."""
+    words = re.findall(r"[a-z]+", str(value or "").casefold())
+    if not words:
+        return False
+    greeting_words = {
+        "hi", "hiya", "hello", "hey", "heya", "greetings", "howdy", "good",
+        "morning", "afternoon", "evening", "there", "how", "are", "you", "doing",
+        "today", "thanks", "thank", "please",
+    }
+    return len(words) <= 10 and all(word in greeting_words for word in words)
 
 
 class Thread:
@@ -71,6 +183,33 @@ class Thread:
         self._cancelled = False
         self._dm_menu_msg_id = None
         self._dm_menu_channel_id = None
+        self._initial_message_id = None
+        self._opening_workflow_active = False
+        self._opening_introduction_sent = False
+        self._opening_autoreply_sent = False
+        self._opening_alias_subscribed = False
+        self._opening_intake_pending = False
+        self._opening_intake_started = False
+        self._opening_collection_open = False
+        self._pending_followup_message = None
+        self._intake_handed_to_agent = False
+        self._intake_collecting = False
+        self._awaiting_initial_inquiry = False
+        self._intake_workflow_lock = asyncio.Lock()
+        self._followup_revision = 0
+        self._ai_form_sent_revision = None
+        self._followup_messages = []
+        self._ai_review_lock = asyncio.Lock()
+        self._abuse_close_lock = asyncio.Lock()
+        self._auto_close_check_active = False
+        self._auto_close_check_message = None
+        self._all_closure_alias_ran = False
+        self._pending_application_username_check = False
+        self._pending_subqual_request = None
+        self._subscription_warning_times = {}
+        self._alias_subscription_bypass_authors = set()
+        self._pending_flightnotlogged_confirmation = None
+        self._informative_rescan_task = None
         # --- SNOOZE STATE ---
         self.snoozed = False  # True if thread is snoozed
         self.snooze_data = None  # Dict with channel/category/position/messages for restoration
@@ -788,10 +927,2114 @@ class Thread:
 
         return self._genesis_message
 
+    async def _send_ai_autoreply(
+        self,
+        name: str,
+        response_text: str,
+        *,
+        author_name: str = "AI-generated reply",
+        footer_text: str = AI_REPLY_FOOTER,
+    ) -> None:
+        """Deliver a configured AI-selected reply and preserve it in the ticket log."""
+        from core.application_reading import expand_application_reading
+
+        response_text = await expand_application_reading(
+            self.bot, response_text, recipient=self.recipient, thread=self
+        )
+        joint_id = generate_ai_message_joint_id()
+        response_text = normalize_generated_reply_layout(response_text)
+        timestamp = discord.utils.utcnow()
+        if self.bot.config.get("message_embeds_v2"):
+            embed = discord.Embed(
+                title="TUI Airways Support Assistant",
+                description=response_text,
+                color=0x70CBF4,
+                timestamp=timestamp,
+            )
+        else:
+            embed = discord.Embed(
+                description=response_text,
+                color=self.bot.mod_color,
+                timestamp=timestamp,
+            )
+        embed.set_author(
+            name="✦ AI assistant",
+            icon_url=self.bot.user.display_avatar.url,
+            url=f"https://discordapp.com/users/{self.bot.user.id}#{joint_id}",
+        )
+        embed.set_footer(text=footer_text)
+        await self.recipient.send(embed=embed)
+        if "```" in response_text:
+            # The recipient must have a chance to fill in a fenced form before AI ALL runs.
+            # A later recipient reply advances the follow-up revision and permits assessment.
+            self._ai_form_sent_revision = self._followup_revision
+
+        try:
+            staff_message = await self.channel.send(embed=embed)
+        except Exception:
+            logger.warning(
+                "AI autoreply was sent to the recipient but not copied to the thread.",
+                exc_info=True,
+            )
+            return
+
+        log_message = SimpleNamespace(
+            id=staff_message.id,
+            channel=self.channel,
+            created_at=staff_message.created_at,
+            author=self.bot.user,
+            content=f"[AI autoreply: {name}]\n{response_text}\n\n{footer_text}",
+            attachments=[],
+        )
+        try:
+            await self.bot.api.append_log(
+                log_message,
+                message_id=staff_message.id,
+                channel_id=self.channel.id,
+                type_="thread_message",
+            )
+        except Exception:
+            logger.warning("Failed to append an AI autoreply to the ticket log.", exc_info=True)
+
+    def _is_ai_autoreply_message(self, message) -> bool:
+        """Return whether a bot-authored message uses the AI autoreply footer."""
+        if (
+            not message
+            or getattr(message, "author", None) != self.bot.user
+            or not message.embeds
+        ):
+            return False
+        footer = getattr(message.embeds[0], "footer", None)
+        footer_text = getattr(footer, "text", "") or ""
+        author_name = getattr(message.embeds[0].author, "name", "") or ""
+        return footer_text.casefold().startswith("this reply is ai generated") or author_name in {
+            "AI assistant",
+            "✦ AI assistant",
+        }
+
+    async def _find_legacy_ai_autoreply_messages(self, staff_message) -> typing.List:
+        """Match an older unlinked AI staff copy to its recipient DM by content and time."""
+        messages = [staff_message]
+        source_embed = staff_message.embeds[0]
+        source_description = source_embed.description or ""
+
+        for user in self.recipients:
+            closest_message = None
+            closest_distance = None
+            async for candidate in user.history(limit=None):
+                if not self._is_ai_autoreply_message(candidate):
+                    continue
+                if (candidate.embeds[0].description or "") != source_description:
+                    continue
+                distance = abs((candidate.created_at - staff_message.created_at).total_seconds())
+                if closest_distance is None or distance < closest_distance:
+                    closest_message = candidate
+                    closest_distance = distance
+            if closest_message is not None:
+                messages.append(closest_message)
+
+        # Deleting the staff copy is still useful if an old DM counterpart cannot be found.
+        return messages
+
+    async def _log_ai_check(
+        self,
+        initial_message,
+        ticket_text: str,
+        *,
+        outcome: str,
+        detail: str,
+        selected_name: typing.Optional[str] = None,
+        response_text: typing.Optional[str] = None,
+        delivery_status: str = "No AI reply was sent.",
+    ) -> None:
+        """Audit a Gemini check in the configured Discord channel without exposing credentials."""
+        channel_id = self.bot.config.get("gemini_log_channel_id")
+        if not channel_id:
+            return
+
+        try:
+            audit_channel = self.bot.get_channel(int(channel_id))
+            if audit_channel is None:
+                audit_channel = await self.bot.fetch_channel(int(channel_id))
+            if not hasattr(audit_channel, "send"):
+                raise TypeError("Gemini log channel is not messageable.")
+
+            error_outcomes = {
+                "configuration_error",
+                "delivery_error",
+                "duplicate_guard_error",
+                "http_error",
+                "invalid_response",
+                "request_error",
+            }
+            color = self.bot.error_color if outcome in error_outcomes else self.bot.main_color
+            embed = discord.Embed(
+                title="Gemini AI ticket check",
+                color=color,
+                timestamp=discord.utils.utcnow(),
+            )
+            channel_name = getattr(self.channel, "name", "unknown-ticket")
+            thread_reference = f"#{channel_name} (`{self.channel.id}`)"
+            if getattr(audit_channel, "guild", None) == getattr(self.channel, "guild", None):
+                thread_reference = f"{self.channel.mention} — {thread_reference}"
+            embed.description = (
+                f"**Ticket:** {thread_reference}\n"
+                f"**Recipient:** {self.recipient.mention} (`{self.recipient.id}`)"
+            )
+            embed.add_field(
+                name="Message checked",
+                value=truncate(ticket_text or "[No reviewable text]", 1024),
+                inline=False,
+            )
+
+            outcome_text = outcome.replace("_", " ").title()
+            if selected_name:
+                outcome_text += f" — `{selected_name}`"
+            if detail:
+                outcome_text += f"\n{detail}"
+            embed.add_field(
+                name="Gemini decision",
+                value=truncate(outcome_text, 1024),
+                inline=False,
+            )
+
+            if response_text:
+                reply_log = (
+                    f"{response_text}\n\n"
+                    f"Footer: {AI_REPLY_FOOTER}\n"
+                    f"Delivery: {delivery_status}"
+                )
+            else:
+                reply_log = delivery_status
+            embed.add_field(
+                name="Reply sent to recipient",
+                value=truncate(reply_log, 1024),
+                inline=False,
+            )
+            embed.set_footer(
+                text=(
+                    f"Message ID: {getattr(initial_message, 'id', 'unknown')} • "
+                    f"Model: {self.bot.config.get('gemini_model')}"
+                )
+            )
+            await audit_channel.send(embed=embed)
+        except Exception:
+            logger.warning("Failed to send the Gemini ticket-check audit log.", exc_info=True)
+
+    @staticmethod
+    def _ai_ticket_text(message) -> str:
+        ticket_text = build_ticket_text(message)
+        try:
+            forwarded_text = extract_forwarded_content(message)
+        except Exception:
+            forwarded_text = None
+        if forwarded_text:
+            ticket_text = forwarded_text[:12_000]
+        return ticket_text
+
+    def contains_abusive_message(self, message) -> bool:
+        """Return whether a recipient message should trigger the automatic abuse close."""
+        return message is not None and contains_abusive_language(
+            self._ai_ticket_text(message),
+            extra_terms=self.bot.config.get("abuse_filter_extra_terms") or (),
+        )
+
+    async def auto_close_for_abuse(self, message) -> bool:
+        """Relay the approved abuse warning, log it, and close a matching ticket once."""
+        if not self.contains_abusive_message(message):
+            return False
+
+        async with self._abuse_close_lock:
+            if self.channel is None or self.channel.id in self.manager.closing:
+                return True
+
+            synthetic = DummyMessage(copy.copy(message))
+            synthetic.author = self.bot.user
+            synthetic.channel = self.channel
+            synthetic.guild = self.channel.guild
+            synthetic.content = ABUSE_AUTO_CLOSE_MESSAGE
+            synthetic.attachments = []
+            synthetic.embeds = []
+            synthetic.stickers = []
+            synthetic.created_at = discord.utils.utcnow()
+            synthetic.id = generate_ai_message_joint_id()
+
+            delivered = False
+            try:
+                result = await self.reply(
+                    synthetic,
+                    content=ABUSE_AUTO_CLOSE_MESSAGE,
+                )
+                delivered = isinstance(result, tuple) and bool(result[0])
+            except Exception:
+                logger.warning(
+                    "Failed to send the normal abuse auto-close warning; using the close message.",
+                    exc_info=True,
+                )
+
+            try:
+                await self.close(
+                    closer=self.bot.user,
+                    silent=delivered,
+                    message=ABUSE_AUTO_CLOSE_MESSAGE,
+                )
+            except Exception:
+                logger.error("Failed to automatically close an abusive ticket.", exc_info=True)
+            return True
+
+    async def consider_ai_autoreply(self, message) -> None:
+        """Run deterministic and Gemini autoreplies for qualifying recipient messages."""
+        if message is None:
+            return
+
+        # Abuse handling is deterministic and closes the ticket after relay. Never spend an AI
+        # request or send another automatic response for a message that will be closed.
+        if self.contains_abusive_message(message):
+            return
+
+        from core.application_reading import handle_reading_question
+
+        if await handle_reading_question(self, message):
+            return
+
+        async with self._ai_review_lock:
+            # Preserve opening delivery state across every review hook until the opening workflow
+            # finishes. A second check must not forget an alias already sent and then emit a late
+            # welcome or incorrect human handoff.
+            if not self._opening_intake_pending:
+                self._opening_introduction_sent = False
+                self._opening_autoreply_sent = False
+                self._opening_alias_subscribed = False
+            if not self.bot.config.get("gemini_ai_enabled"):
+                return
+
+            ticket_text = self._ai_ticket_text(message)
+            if has_roblox_game_pass_url(ticket_text):
+                # This system rule has its own durable type claim. Continue afterward so the same
+                # message may also receive a different configured autoreply when relevant.
+                await self._run_roblox_game_pass_autoreply(message, ticket_text)
+
+            # Every qualifying recipient message may select a different configured type. The
+            # database-backed claim in _run_ai_review still suppresses each type permanently.
+            if not self._matches_ai_autoreply_trigger(ticket_text):
+                return
+            await self._run_ai_review(message, ticket_text)
+
+    @staticmethod
+    def _is_flightnotlogged_alias(alias_action) -> bool:
+        return bool(
+            alias_action
+            and str(alias_action.get("alias") or "").strip().casefold()
+            == "flightnotlogged"
+        )
+
+    async def _request_flightnotlogged_confirmation(
+        self,
+        display_name: str,
+        alias_action,
+        response_text: str,
+        source_message,
+        *,
+        form_fills: typing.Optional[typing.Mapping[str, str]] = None,
+    ) -> None:
+        """Pause the flightnotlogged alias until its eligibility prompt is confirmed."""
+        self._pending_flightnotlogged_confirmation = {
+            "display_name": display_name,
+            "alias_action": alias_action,
+            "response_text": response_text,
+            "form_fills": dict(form_fills or {}),
+        }
+        await self._send_ai_autoreply(
+            "Flight logging dispute confirmation",
+            "We're sorry that your flight has not been correctly logged within eCrew.\n\n"
+            "Before we notify our team, please confirm that **one of the following applies to "
+            "your enquiry:**\n\n"
+            "> - I received a DM stating that I was **ABSENT**, and I wish to dispute this.\n"
+            "> - My flight has **NOT** appeared on eCrew **24 hours after the flight concluded**.\n"
+            "> - I have another **Flight Logging Dispute**.\n\n"
+            "If you wish to continue with this request, please reply **\"Yes\"** below.\n\n"
+            "Otherwise, please state your new enquiry or reply **\"close\"** to close this request.",
+        )
+        self._intake_collecting = True
+
+    async def handle_flightnotlogged_confirmation(self, message) -> bool:
+        """Handle Yes/Close/new-enquiry while the flightnotlogged alias is paused."""
+        pending = self._pending_flightnotlogged_confirmation
+        if not pending:
+            return False
+        message_text = build_ticket_text(message).strip()
+        normalized = " ".join(re.findall(r"[a-z0-9']+", message_text.casefold()))
+        if normalized in {"yes", "yes please", "yeah", "yep", "continue", "proceed"}:
+            decision = "yes"
+        elif normalized in {"close", "close it", "close ticket", "close the ticket"}:
+            decision = "close"
+        else:
+            api_key = self.bot.config.get("gemini_api_key", convert=False)
+            if api_key and self.bot.session is not None:
+                reviewer = GeminiFlightLogConfirmationClassifier(
+                    self.bot.session,
+                    str(api_key),
+                    model=AI_INTAKE_MODEL,
+                    timeout_seconds=20,
+                )
+                decision = await reviewer.classify_confirmation(message_text)
+            else:
+                decision = "new_inquiry"
+
+        self._pending_flightnotlogged_confirmation = None
+        if decision == "close":
+            await self.close(closer=self.bot.user)
+            return True
+        if decision != "yes":
+            # The recipient changed topic. Let the normal autoreply/intake workflow assess this
+            # exact message from scratch now that the confirmation gate has been cleared.
+            return False
+
+        display_name = pending["display_name"]
+        alias_action = pending["alias_action"]
+        autoreply_type = resolve_ai_autoreply_type(display_name, alias_action)
+        try:
+            claimed = await self.bot.api.claim_ai_autoreply(
+                self.channel.id,
+                autoreply_type,
+                display_name,
+            )
+        except Exception:
+            logger.exception("Could not claim confirmed flightnotlogged autoreply.")
+            await self.channel.send(
+                "The flight logging workflow could not be started automatically; awaiting an agent."
+            )
+            await self.channel.send("**You may now reply**")
+            return True
+        if not claimed:
+            return True
+
+        await self._execute_ai_alias(
+            display_name,
+            alias_action,
+            message,
+            form_fills=pending.get("form_fills"),
+        )
+        self._opening_autoreply_sent = True
+        actual_subscribers = self.bot.config["subscriptions"].get(str(self.id), [])
+        self._opening_alias_subscribed = bool(
+            actual_subscribers
+            or any(
+                step.strip().casefold().startswith("sub ")
+                for step in alias_action.get("steps", [])
+            )
+        )
+        if self._opening_alias_subscribed:
+            self._intake_collecting = False
+            self._intake_handed_to_agent = True
+            await self.channel.send("**You may now reply**")
+        else:
+            self._intake_collecting = True
+            self.schedule_informative_autoreply_rescan(message)
+        return True
+
+    def cancel_informative_autoreply_rescan(self) -> None:
+        """Cancel the no-response rescan because the recipient has replied or work changed."""
+        task = self._informative_rescan_task
+        self._informative_rescan_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    def schedule_informative_autoreply_rescan(self, source_message) -> None:
+        """Reassess an informative autoreply after five quiet minutes."""
+        self.cancel_informative_autoreply_rescan()
+        # An informative automatic answer temporarily returns ownership to intake so its reply or
+        # quiet-ticket timer can be assessed even if an older workflow had handed the ticket off.
+        self._intake_handed_to_agent = False
+        self._intake_collecting = True
+        revision = self._followup_revision
+
+        async def delayed_rescan():
+            try:
+                await asyncio.sleep(5 * 60)
+                if (
+                    revision != self._followup_revision
+                    or self._pending_flightnotlogged_confirmation is not None
+                    or self.bot.config["subscriptions"].get(str(self.id), [])
+                    or self._opening_alias_subscribed
+                ):
+                    return
+                async with self._intake_workflow_lock:
+                    if revision != self._followup_revision:
+                        return
+                    self._informative_rescan_task = None
+                    await self.run_ai_intake_workflow(
+                        source_message,
+                        opening=False,
+                        autoreply_only=False,
+                    )
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                logger.exception("Five-minute informative autoreply rescan failed.")
+                self._informative_rescan_task = None
+
+        self._informative_rescan_task = self.bot.loop.create_task(delayed_rescan())
+
+    async def _run_automatic_aiall(self) -> None:
+        """Apply the same recipient-facing resolution outcome as the aiall command."""
+        if self.bot.config["subscriptions"].get(str(self.id)):
+            logger.info("Skipping automatic aiall for subscribed ticket %s.", self.id)
+            return
+        if getattr(self, "_ai_form_sent_revision", None) == self._followup_revision:
+            logger.info("Skipping automatic aiall while awaiting a form reply for ticket %s.", self.id)
+            self._intake_collecting = True
+            self._intake_handed_to_agent = False
+            return
+        self.cancel_informative_autoreply_rescan()
+        self._all_closure_alias_ran = True
+        await self._send_ai_autoreply("Automatic all-inquiries closure", AI_ALL_CLOSING)
+        resolved_category = self.channel.guild.get_channel(RESOLVED_CATEGORY_ID)
+        if isinstance(resolved_category, discord.CategoryChannel):
+            await self.channel.move(
+                category=resolved_category,
+                end=True,
+                sync_permissions=True,
+                reason="Automatic AI all-inquiries check marked resolved",
+            )
+        else:
+            logger.warning(
+                "Resolved category %s was unavailable during automatic aiall.",
+                RESOLVED_CATEGORY_ID,
+            )
+        await self.channel.edit(
+            name="resolved",
+            reason="Automatic AI all-inquiries check marked resolved",
+        )
+        await self.close(closer=self.bot.user, after=24 * 60 * 60)
+
+    async def restart_intake_after_aiall(self) -> None:
+        """Turn a substantive post-AI-ALL reply into a fresh intake conversation."""
+        await self.cancel_closure()
+        removed_subscription = self.bot.config["subscriptions"].pop(str(self.id), None)
+        if removed_subscription is not None:
+            await self.bot.config.update()
+        self._all_closure_alias_ran = False
+        self._opening_alias_subscribed = False
+        self._opening_autoreply_sent = False
+        self._intake_handed_to_agent = False
+        self._intake_collecting = True
+        self._awaiting_initial_inquiry = False
+
+    async def run_ai_intake_workflow(
+        self,
+        message,
+        *,
+        opening: bool = False,
+        autoreply_only: bool = False,
+        followup_revision: typing.Optional[int] = None,
+    ) -> None:
+        """Run autoreply selection followed by one clarity/resolution assessment."""
+        from core.application_reading import handle_reading_question
+
+        if await handle_reading_question(
+            self, message,
+            allow_resolution=(
+                opening or self._awaiting_initial_inquiry
+                or getattr(self, "_all_closure_alias_ran", False)
+            ),
+        ):
+            return
+        if self._intake_handed_to_agent and not autoreply_only:
+            return
+        if self.bot.config["subscriptions"].get(str(self.id), []):
+            self._opening_alias_subscribed = True
+            self._intake_collecting = False
+            self._intake_handed_to_agent = True
+            return
+        self._opening_workflow_active = opening
+        try:
+            if autoreply_only:
+                await self.consider_ai_autoreply(message)
+            else:
+                # Full onboarding selects from every configured autoreply in the intake assessment
+                # itself. Keep the fixed game-pass detector deterministic, but do not make a second
+                # Gemini classification call here.
+                ticket_text = self._ai_ticket_text(message)
+                if has_roblox_game_pass_url(ticket_text):
+                    await self._run_roblox_game_pass_autoreply(message, ticket_text)
+        finally:
+            self._opening_workflow_active = False
+
+        if self._opening_alias_subscribed:
+            self._intake_collecting = False
+            self._intake_handed_to_agent = True
+            await self.channel.send(
+                "Awaiting the subscribed agent. Automated resolution checks were skipped.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+            await self.channel.send("**You may now reply**")
+            return
+
+        # A newly delivered informative autoreply owns the next decision point. Wait for either
+        # the recipient's next message or its five-minute quiet timer instead of scanning it again
+        # immediately in this same workflow invocation.
+        if autoreply_only and self._informative_rescan_task is not None:
+            return
+
+        # Later messages do not run automatic generative intake. They may only continue into the
+        # resolution check when a configured autoreply was actually delivered.
+        if autoreply_only and not self._opening_autoreply_sent:
+            return
+
+        if opening and is_greeting_only_intake(build_ticket_text(message)):
+            self._awaiting_initial_inquiry = True
+            self._intake_collecting = True
+            return
+
+        api_key = self.bot.config.get("gemini_api_key", convert=False)
+        if not api_key or self.bot.session is None:
+            self._intake_collecting = False
+            self._intake_handed_to_agent = True
+            await self.channel.send("AI intake assessment unavailable; awaiting an agent.")
+            await self.channel.send("**You may now reply**")
+            return
+        try:
+            log_entry = await self.bot.api.get_log(self.channel.id)
+            from core.ai_sorter import build_sorting_transcript
+
+            transcript = build_sorting_transcript(
+                (log_entry or {}).get("messages") or [],
+                bot_user_id=self.bot.user.id,
+            )
+            current_text = build_ticket_text(message)
+            if current_text:
+                transcript += "\n\n---\n\n[CURRENT RECIPIENT MESSAGE]\n" + current_text
+            intake_questions_asked = count_logged_intake_questions(
+                (log_entry or {}).get("messages") or [],
+                bot_user_id=self.bot.user.id,
+            )
+        except Exception:
+            logger.warning("Could not build the intake assessment transcript.", exc_info=True)
+            self._intake_collecting = False
+            self._intake_handed_to_agent = True
+            await self.channel.send("Could not assess the intake; awaiting an agent.")
+            await self.channel.send("**You may now reply**")
+            return
+        autoreplies = {}
+        alias_actions = {}
+        if not autoreply_only and (
+            not is_acknowledgement_only(current_text) or self._intake_collecting
+        ):
+            autoreplies, alias_actions, _ = self._resolve_ai_autoreplies(
+                current_text,
+                require_trigger=False,
+            )
+            try:
+                sent_types = await self.bot.api.get_ai_autoreplies_sent(self.channel.id)
+            except Exception:
+                sent_types = set()
+                logger.warning(
+                    "Failed to pre-load sent autoreplies for onboarding selection.",
+                    exc_info=True,
+                )
+            autoreplies = {
+                name: response
+                for name, response in autoreplies.items()
+                if resolve_ai_autoreply_type(name, alias_actions.get(name)) not in sent_types
+            }
+            alias_actions = {
+                name: action for name, action in alias_actions.items() if name in autoreplies
+            }
+
+        autoreply_catalog = {
+            name: (alias_actions.get(name) or {}).get("alias", "") or name
+            for name in autoreplies
+        }
+        autoreply_forms = {
+            name: extract_blank_form_fields(response)
+            for name, response in autoreplies.items()
+            if extract_blank_form_fields(response)
+        }
+        trigger_matched_autoreplies = []
+        if autoreplies:
+            triggered_choices, _, _ = self._resolve_ai_autoreplies(
+                current_text,
+                require_trigger=True,
+            )
+            trigger_matched_autoreplies = [
+                name for name in triggered_choices if name in autoreplies
+            ]
+        assessor = GeminiIntakeAssessment(
+            self.bot.session,
+            str(api_key),
+            model=AI_INTAKE_MODEL,
+        )
+        result = await assessor.assess(
+            transcript,
+            autoreply_sent=self._opening_autoreply_sent,
+            questions_asked=intake_questions_asked,
+            autoreply_catalog=autoreply_catalog,
+            autoreply_guidance={
+                name: action.get("additional_info", "")
+                for name, action in alias_actions.items()
+            },
+            autoreply_forms=autoreply_forms,
+            trigger_matched_autoreplies=trigger_matched_autoreplies,
+            trusted_recipient_username=str(
+                getattr(getattr(message, "author", None), "name", "") or ""
+            ),
+            handoff_teams={
+                name: details["guidance"]
+                for name, details in AI_HANDOFF_TEAMS.items()
+            },
+        )
+        # A newer recipient message arrived while Gemini was assessing this batch. Its debounced
+        # workflow owns the next response, so this stale result must never send a clarification.
+        if followup_revision is not None and followup_revision != self._followup_revision:
+            return
+        if result is None:
+            self._intake_collecting = False
+            self._intake_handed_to_agent = True
+            failure_detail = str(
+                assessor.last_detail or "Gemini did not return a usable assessment."
+            ).strip()
+            await self.channel.send(
+                f"AI intake assessment failed: {failure_detail} Awaiting an agent."
+            )
+            await self._log_ai_check(
+                message,
+                build_ticket_text(message),
+                outcome=assessor.last_outcome,
+                detail=assessor.last_detail,
+                selected_name="intake assessment",
+                delivery_status="Assessment failed; ticket left for a human agent.",
+            )
+            await self.channel.send("**You may now reply**")
+            return
+
+        selected_autoreply = result["selected_autoreply"]
+        # Invalid-invite requests require evidence before they can be handed off or resolved.
+        # Keep this guard in the workflow as well as in the model prompt so a permissive model
+        # result cannot skip the required form and invite collection.
+        invalid_invite_request = bool(
+            re.search(r"\binvalid\b.{0,80}\binvite\b|\binvite\b.{0,80}\binvalid\b", current_text, re.I | re.S)
+        )
+        has_discord_invite = bool(
+            re.search(r"(?:https?://)?(?:discord(?:app)?\.com/invite|discord\.gg)/[A-Za-z0-9-]+", current_text, re.I)
+        )
+        has_applied_role = bool(
+            re.search(r"(?:applied\s*-?\s*for\s*role|applied\s*role|application\s*role)\s*:\s*\S+", current_text, re.I)
+        )
+        if invalid_invite_request and not (has_discord_invite and has_applied_role):
+            selected_autoreply = None
+            result["clear"] = False
+            result["resolved"] = False
+            result["remaining_inquiries"] = ["the applied-for role and Discord invitation"]
+            result["clarification_question"] = (
+                "Please provide the following:\n\n```\nAPPLIED FOR ROLE:\nDISCORD INVITE:\n```"
+            )
+        if selected_autoreply is not None:
+            alias_action = alias_actions.get(selected_autoreply)
+            if self._is_flightnotlogged_alias(alias_action):
+                if (
+                    self._opening_workflow_active or self._opening_intake_pending
+                ) and not self._opening_introduction_sent:
+                    await self._send_ai_autoreply(
+                        "Opening AI introduction",
+                        "Hello. I am an AI assistant and I will be helping you today.",
+                        author_name="AI assistant",
+                        footer_text=AI_HELLO_FOOTER,
+                    )
+                    self._opening_introduction_sent = True
+                await self._request_flightnotlogged_confirmation(
+                    selected_autoreply,
+                    alias_action,
+                    autoreplies[selected_autoreply],
+                    message,
+                    form_fills=result["form_fills"],
+                )
+                await self._log_ai_check(
+                    message,
+                    current_text,
+                    outcome="confirmation_required",
+                    detail="The flightnotlogged alias is awaiting recipient confirmation.",
+                    selected_name=selected_autoreply,
+                    delivery_status="Eligibility confirmation sent; alias actions deferred.",
+                )
+                return
+            autoreply_type = resolve_ai_autoreply_type(selected_autoreply, alias_action)
+            try:
+                claimed = await self.bot.api.claim_ai_autoreply(
+                    self.channel.id,
+                    autoreply_type,
+                    selected_autoreply,
+                )
+            except Exception:
+                claimed = False
+                logger.error(
+                    "Onboarding autoreply was blocked because duplicate safety failed.",
+                    exc_info=True,
+                )
+            if claimed:
+                try:
+                    if alias_action is None:
+                        await self._send_ai_autoreply(
+                            selected_autoreply,
+                            autoreplies[selected_autoreply],
+                        )
+                    else:
+                        await self._execute_ai_alias(
+                            selected_autoreply,
+                            alias_action,
+                            message,
+                            form_fills=result["form_fills"],
+                        )
+                    self._opening_autoreply_sent = True
+                    actual_subscribers = self.bot.config["subscriptions"].get(str(self.id), [])
+                    self._opening_alias_subscribed = bool(
+                        actual_subscribers
+                        or (
+                            alias_action
+                            and any(
+                                step.strip().casefold().startswith("sub ")
+                                for step in alias_action.get("steps", [])
+                            )
+                        )
+                    )
+                    await self._log_ai_check(
+                        message,
+                        current_text,
+                        outcome="matched",
+                        detail="Selected from the complete onboarding autoreply catalogue.",
+                        selected_name=selected_autoreply,
+                        delivery_status=(
+                            f"AI alias `{alias_action['alias']}` executed in full."
+                            if alias_action
+                            else "AI autoreply delivered."
+                        ),
+                    )
+                    if self._opening_alias_subscribed:
+                        self._intake_collecting = False
+                        self._intake_handed_to_agent = True
+                        await self.channel.send("**You may now reply**")
+                    elif alias_action is not None:
+                        self._intake_collecting = False
+                        self._intake_handed_to_agent = True
+                        if not (
+                            self._pending_application_username_check
+                            or self._pending_subqual_request is not None
+                        ):
+                            await self._run_automatic_aiall()
+                    else:
+                        self._intake_collecting = True
+                        self.schedule_informative_autoreply_rescan(message)
+                    # Never stack an intake clarification or handoff on the selected autoreply.
+                    return
+                except Exception:
+                    logger.exception("Failed to execute the onboarding-selected autoreply.")
+
+        # A recipient message can arrive after the opening snapshot while Gemini is working.
+        # Give its configured autoreply priority before emitting a now-stale clarification.
+        if opening:
+            await asyncio.sleep(1)
+        if opening and self._pending_followup_message is not None:
+            pending = self._pending_followup_message
+            self._pending_followup_message = None
+            await self.consider_ai_autoreply(pending)
+            if self._opening_alias_subscribed:
+                self._intake_collecting = False
+                self._intake_handed_to_agent = True
+                await self.channel.send(
+                    "Awaiting the subscribed agent. Automated resolution checks were skipped.",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await self.channel.send("**You may now reply**")
+                return
+
+        remaining = "; ".join(result["remaining_inquiries"]) or "the stated inquiry"
+        handoff_context = (
+            f"**Ticket summary:** {result['ticket_summary'] or 'No summary available.'}\n"
+            f"**Question/request:** {result['primary_question'] or remaining}"
+        )
+        await self._log_ai_check(
+            message,
+            build_ticket_text(message),
+            outcome="resolved" if result["resolved"] else "needs_follow_up",
+            detail=(
+                f"Clear: {result['clear']}. Resolved: {result['resolved']}. "
+                f"Remaining inquiries: {remaining}."
+            ),
+            selected_name="intake assessment",
+            response_text=result["clarification_question"],
+            delivery_status="Opening/follow-up intake decision recorded.",
+        )
+        if self._opening_autoreply_sent and result["resolved"]:
+            self._intake_collecting = False
+            self._intake_handed_to_agent = True
+            await self._run_automatic_aiall()
+            return
+        if not result["clear"]:
+            if intake_questions_asked >= AI_INTAKE_MAX_QUESTIONS:
+                self._intake_collecting = False
+                self._intake_handed_to_agent = True
+                await self._send_smart_intake_handoff(result, handoff_context)
+                return
+            question = result["clarification_question"] or (
+                "Could you please clarify exactly what you need assistance with?"
+            )
+            self._intake_collecting = True
+            await self.channel.send(
+                f"Intake clarification {intake_questions_asked + 1}/{AI_INTAKE_MAX_QUESTIONS}: "
+                f"{question}"
+            )
+            await self._send_ai_autoreply("Intake clarification", question)
+            return
+
+        await self.channel.send(f"Remaining inquiries: {remaining}\nAwaiting an agent.")
+        self._intake_collecting = False
+        self._intake_handed_to_agent = True
+        await self._send_smart_intake_handoff(result, handoff_context)
+
+    async def _send_smart_intake_handoff(self, result, handoff_context: str) -> None:
+        """Deliver the existing handoff while naming and notifying the AI-selected team."""
+        team_name = str(result.get("handoff_team") or "General Support Staff")
+        if team_name not in AI_HANDOFF_TEAMS:
+            team_name = "General Support Staff"
+        role_id = AI_HANDOFF_TEAMS[team_name]["role_id"]
+        role_mention = f"<@&{role_id}>"
+        subscription_key = str(self.id)
+        subscriptions = self.bot.config["subscriptions"].setdefault(
+            subscription_key,
+            [],
+        )
+        if role_mention not in subscriptions:
+            subscriptions.append(role_mention)
+            await self.bot.config.update()
+        recipient_message = AI_INTAKE_HANDOFF.replace(
+            "the appropriate team",
+            f"**{team_name}**",
+        )
+        await self._send_ai_autoreply("Automatic intake handoff", recipient_message)
+        await self.channel.send(
+            f"{role_mention}\n**Smart handoff:** {team_name}\n"
+            f"**You may now reply**\n{handoff_context}",
+            allowed_mentions=discord.AllowedMentions(
+                everyone=False,
+                users=False,
+                roles=[discord.Object(id=role_id)],
+                replied_user=False,
+            ),
+        )
+
+    async def begin_opening_intake_workflow(self, initial_message) -> None:
+        """Observe ten seconds of normally relayed messages before assessing the opening intake."""
+        if self._opening_intake_started:
+            return
+        self._opening_intake_started = True
+        self._opening_intake_pending = True
+        self._opening_collection_open = True
+        try:
+            async with self._intake_workflow_lock:
+                await self.channel.send(
+                    "**PLEASE DO NOT REPLY YET.**",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                await asyncio.sleep(10)
+                self._opening_collection_open = False
+                combined = DummyMessage(copy.copy(initial_message))
+                try:
+                    log_entry = await self.bot.api.get_log(self.channel.id)
+                    parts = []
+                    for item in (log_entry or {}).get("messages") or []:
+                        author = item.get("author") or {}
+                        if author.get("mod") is False:
+                            content = str(item.get("content") or "").strip()
+                            if content:
+                                parts.append(content)
+                    combined.content = "\n\n".join(parts) or str(initial_message.content or "")
+                except Exception:
+                    logger.warning("Could not combine live opening messages for AI intake.", exc_info=True)
+                combined.attachments = getattr(initial_message, "attachments", [])
+                await self.run_ai_intake_workflow(combined, opening=True)
+        finally:
+            self._opening_collection_open = False
+            self._opening_intake_pending = False
+            pending = self._pending_followup_message
+            self._pending_followup_message = None
+            if pending is not None:
+                self.bot.loop.create_task(
+                    self.begin_followup_autoreply_workflow(
+                        pending,
+                        full_intake=self._awaiting_initial_inquiry,
+                    )
+                )
+
+    async def begin_followup_autoreply_workflow(
+        self,
+        message,
+        delay: float = 0.0,
+        *,
+        full_intake: bool = False,
+    ) -> None:
+        """Immediately run configured autoreplies and their resolved check for follow-ups."""
+        self._followup_messages.append(message)
+        self._followup_revision += 1
+        revision = self._followup_revision
+        await asyncio.sleep(delay)
+        if revision != self._followup_revision or self._opening_intake_pending:
+            return
+        async with self._intake_workflow_lock:
+            if revision != self._followup_revision:
+                return
+            combined = DummyMessage(copy.copy(message))
+            pending_messages = self._followup_messages
+            self._followup_messages = []
+            recipient_parts = [
+                build_ticket_text(item)
+                for item in pending_messages
+                if build_ticket_text(item)
+            ]
+            combined.content = "\n\n".join(recipient_parts) or str(message.content or "")
+            combined.attachments = []
+            if full_intake:
+                self._awaiting_initial_inquiry = False
+            await self.run_ai_intake_workflow(
+                combined,
+                opening=False,
+                autoreply_only=not full_intake,
+                followup_revision=revision,
+            )
+
+    async def begin_acknowledgement_closure_workflow(
+        self,
+        message,
+        delay: float = 0.0,
+    ) -> None:
+        """Immediately assess an acknowledgement, then close or re-ping subscribers."""
+        self._followup_revision += 1
+        revision = self._followup_revision
+        await asyncio.sleep(delay)
+        if revision != self._followup_revision or self._opening_intake_pending:
+            return
+
+        current_text = build_ticket_text(message)
+        if self._all_closure_alias_ran and is_acknowledgement_only(current_text):
+            await self._send_ai_autoreply(
+                "Automatic AI ticket closure",
+                AI_TICKET_CLOSED_MESSAGE,
+            )
+            await self._log_ai_check(
+                message,
+                current_text,
+                outcome="resolved",
+                detail="Recipient confirmed that no further assistance was needed after AI ALL.",
+                selected_name="automatic aibye",
+                response_text=AI_TICKET_CLOSED_MESSAGE,
+                delivery_status="Automatic AI closure delivered and ticket closed.",
+            )
+            await self.close(closer=self.bot.user)
+            return
+
+        async with self._intake_workflow_lock:
+            if revision != self._followup_revision:
+                return
+            api_key = self.bot.config.get("gemini_api_key", convert=False)
+            if not api_key or self.bot.session is None:
+                return
+            try:
+                log_entry = await self.bot.api.get_log(self.channel.id)
+                from core.ai_sorter import build_sorting_transcript
+
+                transcript = build_sorting_transcript(
+                    (log_entry or {}).get("messages") or [],
+                    bot_user_id=self.bot.user.id,
+                )
+                if current_text:
+                    transcript += "\n\n---\n\n[LATEST RECIPIENT ACKNOWLEDGEMENT]\n" + current_text
+                questions_asked = count_logged_intake_questions(
+                    (log_entry or {}).get("messages") or [],
+                    bot_user_id=self.bot.user.id,
+                )
+            except Exception:
+                logger.warning("Could not build acknowledgement closure transcript.", exc_info=True)
+                return
+
+            assessor = GeminiIntakeAssessment(
+                self.bot.session,
+                str(api_key),
+                model=AI_INTAKE_MODEL,
+            )
+            auto_closed = False
+            self._auto_close_check_active = True
+            try:
+                self._auto_close_check_message = await self.channel.send(
+                    "**DO NOT CLOSE - AUTO CHECKING**",
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+                result = await assessor.assess(
+                    transcript,
+                    autoreply_sent=True,
+                    questions_asked=questions_asked,
+                    autoreply_catalog={},
+                )
+                if result is None or revision != self._followup_revision:
+                    return
+
+                outstanding = [
+                    inquiry.strip()
+                    for inquiry in result["remaining_inquiries"]
+                    if inquiry.strip()
+                ]
+                if outstanding or not result["resolved"]:
+                    question = "; ".join(outstanding) or result["primary_question"]
+                    mentions = " ".join(
+                        dict.fromkeys(self.bot.config["subscriptions"].get(str(self.id), []))
+                    )
+                    prefix = f"{mentions} " if mentions else ""
+                    await self.channel.send(
+                        f"{prefix}**Reply requested — outstanding question:** "
+                        f"{question or 'The recipient still requires assistance.'}"
+                    )
+                    await self._log_ai_check(
+                        message,
+                        current_text,
+                        outcome="needs_follow_up",
+                        detail=f"Acknowledgement received with an outstanding inquiry: {question}",
+                        selected_name="acknowledgement resolution check",
+                        delivery_status="Subscribed users were pinged again; ticket remains open.",
+                    )
+                    return
+
+                await self._send_ai_autoreply(
+                    "Automatic AI ticket closure",
+                    AI_TICKET_CLOSED_MESSAGE,
+                )
+                await self._log_ai_check(
+                    message,
+                    current_text,
+                    outcome="resolved",
+                    detail="Acknowledgement received and no unanswered inquiry remained.",
+                    selected_name="automatic aibye",
+                    response_text=AI_TICKET_CLOSED_MESSAGE,
+                    delivery_status="Automatic AI closure delivered and ticket closed.",
+                )
+                await self.close(closer=self.bot.user)
+                auto_closed = True
+            finally:
+                self._auto_close_check_active = False
+                marker = self._auto_close_check_message
+                self._auto_close_check_message = None
+                if not auto_closed and marker is not None:
+                    try:
+                        await marker.delete()
+                    except (discord.NotFound, discord.Forbidden):
+                        pass
+                    except Exception:
+                        logger.warning(
+                            "Could not delete the automatic close-check marker.",
+                            exc_info=True,
+                        )
+
+    async def handle_pending_application_username_check(self, message) -> bool:
+        """Retry a missing application lookup using the username supplied by the recipient."""
+        if not self._pending_application_username_check:
+            return False
+
+        content = str(getattr(message, "content", "") or "").strip()
+        candidates = re.findall(r"(?<![\w.])[A-Za-z0-9_.]{2,32}(?![\w.])", content)
+        ignored = {"my", "discord", "username", "user", "is", "it", "was", "used"}
+        supplied_username = next(
+            (value for value in reversed(candidates) if value.casefold() not in ignored),
+            None,
+        )
+        if supplied_username is None:
+            await self._send_ai_autoreply(
+                "Application username check",
+                "Please provide only the Discord username used on your application so I can check it again.",
+            )
+            return True
+
+        from core.application_status import (
+            APPLICATION_NOT_FOUND,
+            _application_status_reply,
+            lookup_application,
+        )
+
+        record = await lookup_application(self.bot, username=supplied_username)
+        if isinstance(record, str):
+            await self._send_ai_autoreply("Application username check", record)
+            return True
+
+        self._pending_application_username_check = False
+        contacting_username = str(getattr(self.recipient, "name", "") or "").strip()
+        handoff_result = {
+            "handoff_team": "Training & Recruitment",
+            "ticket_summary": "Automatic application lookup requires manual review.",
+            "primary_question": "Please review and locate the recipient's application.",
+        }
+        if record is APPLICATION_NOT_FOUND:
+            response = (
+                "I still couldn't find an application using that Discord username. Please confirm "
+                "the details below so a member of Training & Recruitment can review this manually.\n\n"
+                "```\nROLEPLAY NAME USED:\nTOM CODE:\nDISCORD ID:\n```"
+            )
+            await self._send_ai_autoreply("Application not found", response)
+            await self._send_smart_intake_handoff(
+                handoff_result,
+                "**Application lookup:** No application was found using either Discord username.",
+            )
+            return True
+
+        if supplied_username.casefold() != contacting_username.casefold():
+            response = (
+                f"I found an application under **{supplied_username}**, but that username does not "
+                f"match the Discord account contacting us (**{contacting_username}**). A member of "
+                "Training & Recruitment will review the mismatch and continue the transfer."
+            )
+            await self._send_ai_autoreply("Application account mismatch", response)
+            await self._send_smart_intake_handoff(
+                handoff_result,
+                "**Application lookup:** A record was found, but its supplied Discord username "
+                "does not match the ticket owner.",
+            )
+            return True
+
+        reply, _ = await _application_status_reply(
+            self.bot, self.recipient, return_not_found=True
+        )
+        await self._send_ai_autoreply("Application status", reply)
+        await self._run_automatic_aiall()
+        return True
+
+    async def handle_pending_subqual_request(self, message) -> bool:
+        """Collect and validate a sub-qualification form, then approve or hand it off."""
+        if self._pending_subqual_request is None:
+            return False
+
+        labels = (
+            "YOUR ROBLOX USERNAME",
+            "YOUR DISCORD USERNAME",
+            "MAIN DEPARTMENT",
+            "DESIRED SUB DEPARTMENT",
+            "CURRENTLY HOLD A SUB-QUAL? (Y/N)",
+        )
+        values = self._pending_subqual_request
+        message_text = build_ticket_text(message).strip()
+
+        # Prefer explicit pasted form lines. Gemini fills only the remaining fields when the
+        # recipient answers naturally instead of pasting the form back.
+        for label in labels:
+            match = re.search(
+                rf"(?im)^\s*`*\s*{re.escape(label)}\s*:\s*`*\s*(.+?)\s*`*\s*$",
+                message_text,
+            )
+            if match and match.group(1).strip():
+                values[label] = match.group(1).strip()
+
+        missing = [label for label in labels if not values.get(label)]
+        if missing:
+            api_key = self.bot.config.get("gemini_api_key", convert=False)
+            if api_key and self.bot.session is not None:
+                fields = [
+                    {"field_id": f"field_{index}", "label": label}
+                    for index, label in enumerate(missing, 1)
+                ]
+                reviewer = GeminiFormAutofill(
+                    self.bot.session,
+                    str(api_key),
+                    model=AI_INTAKE_MODEL,
+                )
+                fills = await reviewer.identify_fills(
+                    f"[RECIPIENT MESSAGE]\n{message_text}", fields
+                )
+                for field in fields:
+                    value = (fills or {}).get(field["field_id"])
+                    if value:
+                        values[field["label"]] = value
+
+        missing = [label for label in labels if not values.get(label)]
+        if missing:
+            requested = "\n".join(f"{label}:" for label in missing)
+            await self._send_ai_autoreply(
+                "Sub-qualification details required",
+                "I still need the following information before I can review this request:\n\n"
+                f"```\n{requested}\n```",
+            )
+            return True
+
+        holds_subqual = " ".join(
+            re.findall(r"[a-z]+", values["CURRENTLY HOLD A SUB-QUAL? (Y/N)"].casefold())
+        )
+        yes_values = {"y", "yes", "yeah", "yep", "i do", "currently yes"}
+        no_values = {"n", "no", "nope", "i do not", "i don't", "not currently"}
+        if holds_subqual in yes_values:
+            has_existing_subqual = True
+        elif holds_subqual in no_values:
+            has_existing_subqual = False
+        else:
+            await self._send_ai_autoreply(
+                "Sub-qualification clarification",
+                "Please confirm with **Y** or **N**: do you currently hold a sub-qualification?",
+            )
+            values.pop("CURRENTLY HOLD A SUB-QUAL? (Y/N)", None)
+            return True
+
+        desired = " ".join(
+            re.findall(r"[a-z0-9]+", values["DESIRED SUB DEPARTMENT"].casefold())
+        )
+        position = SUBQUAL_POSITIONS.get(desired)
+        if position is None:
+            values.pop("DESIRED SUB DEPARTMENT", None)
+            await self._send_ai_autoreply(
+                "Sub-qualification department clarification",
+                "Please confirm the desired sub department using one of these options:\n\n"
+                "- Cabin Crew\n- Flight Deck\n- Ground Ops\n- Passenger Services",
+            )
+            return True
+
+        guild = self.bot.get_guild(SUBQUAL_GUILD_ID)
+        member = None
+        if guild is not None:
+            try:
+                member = await self.bot.get_or_fetch_member(guild, self.id)
+            except Exception:
+                logger.warning("Could not check sub-qualification guild tenure.", exc_info=True)
+        joined_at = getattr(member, "joined_at", None)
+        if joined_at is None:
+            self._pending_subqual_request = None
+            result = {
+                "handoff_team": "Training & Recruitment",
+                "ticket_summary": "Sub-qualification tenure could not be verified automatically.",
+                "primary_question": "Please manually review the sub-qualification request.",
+            }
+            await self._send_ai_autoreply(
+                "Sub-qualification review",
+                "I couldn't verify how long you have been in the Careers server. A member of "
+                "Training & Recruitment has been requested to review this manually.",
+            )
+            await self._send_smart_intake_handoff(result, "**Sub-qualification:** Guild tenure needs manual verification.")
+            return True
+
+        if joined_at.tzinfo is None:
+            joined_at = joined_at.replace(tzinfo=timezone.utc)
+        if datetime.now(timezone.utc) - joined_at < timedelta(days=SUBQUAL_REQUIRED_DAYS):
+            self._pending_subqual_request = None
+            await self._send_ai_autoreply(
+                "Sub-qualification declined",
+                "Your sub-qualification request has been declined because you have not been in "
+                f"the Careers server for at least {SUBQUAL_REQUIRED_DAYS} days, which is a requirement.",
+            )
+            await self._run_automatic_aiall()
+            return True
+
+        if has_existing_subqual:
+            self._pending_subqual_request = None
+            result = {
+                "handoff_team": "Training & Recruitment",
+                "ticket_summary": "Applicant already holds a sub-qualification.",
+                "primary_question": "Please manually review the additional sub-qualification request.",
+            }
+            await self._send_ai_autoreply(
+                "Sub-qualification human review",
+                "Because you already hold a sub-qualification, a member of Training & Recruitment "
+                "has been requested to review your request manually.",
+            )
+            await self._send_smart_intake_handoff(result, "**Sub-qualification:** Existing sub-qualification declared; human review required.")
+            return True
+
+        api_key = os.getenv("SUBQUAL_INTERNAL_TRAINEE_API_KEY", "").strip()
+        if not api_key or self.bot.session is None:
+            await self.channel.send(
+                "The internal trainee portal connection is unavailable; awaiting an agent."
+            )
+            return True
+        payload = {
+            "discordUsername": str(getattr(self.recipient, "name", "") or ""),
+            "discordId": str(self.id),
+            "position": position,
+        }
+        provisioning_stage = "portal account creation"
+        try:
+            async with self.bot.session.post(
+                SUBQUAL_TRAINEE_URL,
+                headers={"Content-Type": "application/json", "x-api-key": api_key},
+                json=payload,
+                timeout=20,
+                allow_redirects=False,
+            ) as response:
+                if not 200 <= response.status < 300:
+                    raise RuntimeError(f"Internal trainee API returned HTTP {response.status}")
+                trainee = await response.json()
+            if not isinstance(trainee, Mapping):
+                raise ValueError("Internal trainee API returned an invalid response")
+
+            def find_response_value(value, accepted_keys):
+                if isinstance(value, Mapping):
+                    for key, nested in value.items():
+                        if str(key).casefold() in accepted_keys and isinstance(nested, str):
+                            if nested.strip():
+                                return nested
+                    for nested in value.values():
+                        found = find_response_value(nested, accepted_keys)
+                        if found:
+                            return found
+                elif isinstance(value, (list, tuple)):
+                    for nested in value:
+                        found = find_response_value(nested, accepted_keys)
+                        if found:
+                            return found
+                return None
+
+            portal_credential = find_response_value(
+                trainee,
+                {"applicationref", "application_ref"},
+            )
+            if not isinstance(portal_credential, str) or not portal_credential.strip():
+                raise ValueError("Internal trainee API did not return an application reference")
+
+            provisioning_stage = "one-use Academy invite creation"
+            academy_guild = self.bot.get_guild(SUBQUAL_ACADEMY_GUILD_ID)
+            if academy_guild is None:
+                academy_guild = await self.bot.fetch_guild(SUBQUAL_ACADEMY_GUILD_ID)
+            invite_channels = []
+            system_channel = getattr(academy_guild, "system_channel", None)
+            if system_channel is not None:
+                invite_channels.append(system_channel)
+            invite_channels.extend(
+                channel
+                for channel in getattr(academy_guild, "text_channels", [])
+                if channel not in invite_channels
+            )
+            if not invite_channels and hasattr(academy_guild, "fetch_channels"):
+                invite_channels.extend(
+                    channel
+                    for channel in await academy_guild.fetch_channels()
+                    if hasattr(channel, "create_invite")
+                )
+            invite = None
+            for invite_channel in invite_channels:
+                try:
+                    invite = await invite_channel.create_invite(
+                        max_age=7 * 24 * 60 * 60,
+                        max_uses=1,
+                        unique=True,
+                        reason=f"Approved sub-qualification request for Discord user {self.id}",
+                    )
+                    break
+                except (discord.Forbidden, discord.HTTPException):
+                    continue
+            if invite is None:
+                raise RuntimeError("Could not create a one-use Academy invite")
+        except Exception as exc:
+            logger.exception("Could not provision an approved sub-qualification trainee.")
+            self._pending_subqual_request = None
+            result = {
+                "handoff_team": "Training & Recruitment",
+                "ticket_summary": "Eligible sub-qualification request could not be provisioned.",
+                "primary_question": "Please create the trainee and Academy invite manually.",
+            }
+            await self._send_ai_autoreply(
+                "Sub-qualification provisioning review",
+                "Your request passed the automatic eligibility checks, but I couldn't complete "
+                f"the {provisioning_stage}. A member of Training & Recruitment has been requested "
+                "to complete it manually.",
+            )
+            await self._send_smart_intake_handoff(
+                result,
+                f"**Sub-qualification:** Eligible request; {provisioning_stage} failed. "
+                f"Technical detail: {type(exc).__name__}: {str(exc)[:300]}",
+            )
+            return True
+
+        self._pending_subqual_request = None
+        role_name = position.replace("-", " ").title()
+        approval = (
+            "## <:Globe:1544760634359554189> SUB DEPARTMENT - APPROVED\n\n"
+            f"Hello <@{self.id}>, thank you for reaching out to us regarding your sub department "
+            "request. We have approved your request. You will only have 7 days to complete your "
+            "training or you will have to re-request a sub certification. Note that if you are an "
+            "instructor, you should log out of your instructor account.\n\n"
+            "Here is the link to our academy portal: https://tui-academy.vercel.app/\n\n"
+            "Your Academy username and password are below.\n\n"
+            f"**USER:** `{portal_credential.strip()}`\n"
+            f"**PASSWORD:** `{portal_credential.strip()}`\n\n"
+            "Please note that you will not need to resit your STO Training module. You will be "
+            "moved to your department module. If you have any questions, please reach out via "
+            "Academy Support.\n\n"
+            "Please screenshot the details below within the role-request channel.\n\n"
+            f"**USER:** <@{self.id}>\n"
+            f"**TRAINING FOR:** {role_name}\n"
+            f"**INVITE:** {invite}\n\n"
+            "Many thanks,"
+        )
+        await self._send_ai_autoreply("Sub-qualification approved", approval)
+        await self._run_automatic_aiall()
+        return True
+
+    def begin_subqual_request(self) -> None:
+        """Arm the follow-up workflow when staff invoke the subqual alias manually."""
+        self._pending_subqual_request = {
+            "YOUR DISCORD USERNAME": str(getattr(self.recipient, "name", "") or "").strip()
+        }
+
+    async def _run_roblox_game_pass_autoreply(self, message, ticket_text: str) -> None:
+        """Send the fixed game-pass guidance once per ticket without calling Gemini."""
+        selected_name = "Roblox game-pass link"
+        autoreply_type = "system:roblox-game-pass-url"
+        is_initial_message = self._initial_message_id == getattr(message, "id", None)
+
+        try:
+            claimed = await self.bot.api.claim_ai_autoreply(
+                self.channel.id,
+                autoreply_type,
+                selected_name,
+            )
+        except Exception as exc:
+            error_detail = describe_ai_error(exc)
+            logger.error(
+                "Roblox game-pass autoreply blocked because its duplicate guard failed: %s",
+                error_detail,
+                exc_info=True,
+            )
+            await self._log_ai_check(
+                message,
+                ticket_text,
+                outcome="duplicate_guard_error",
+                detail=(
+                    "The Roblox game-pass URL matched, but the durable duplicate guard failed "
+                    f"({error_detail})."
+                ),
+                selected_name=selected_name,
+                delivery_status="No automatic game-pass reply was sent.",
+            )
+            return
+
+        if not claimed:
+            await self._log_ai_check(
+                message,
+                ticket_text,
+                outcome="duplicate_suppressed",
+                detail="The Roblox game-pass autoreply was already sent in this ticket.",
+                selected_name=selected_name,
+                delivery_status="Duplicate suppressed; no AI reply was sent.",
+            )
+            return
+
+        delivery_error = None
+        try:
+            if self._opening_workflow_active and not self._opening_autoreply_sent:
+                await self._send_ai_autoreply(
+                    "Opening AI introduction",
+                    "Hello. I am an AI assistant and I will be helping you today.",
+                    author_name="AI assistant",
+                    footer_text=AI_HELLO_FOOTER,
+                )
+            await self._send_ai_autoreply(selected_name, ROBLOX_GAME_PASS_AUTOREPLY)
+            self._opening_autoreply_sent = True
+            delivery_status = (
+                "Automatic game-pass guidance delivered after the connected ticket-opened message."
+                if is_initial_message
+                else "Automatic game-pass guidance delivered after a recipient message."
+            )
+        except Exception as exc:
+            delivery_error = exc
+            error_detail = describe_ai_error(exc)
+            delivery_status = f"Automatic game-pass reply delivery failed ({error_detail})."
+            logger.error(
+                "Roblox game-pass autoreply delivery failed: %s",
+                error_detail,
+                exc_info=True,
+            )
+
+        await self._log_ai_check(
+            message,
+            ticket_text,
+            outcome="matched" if delivery_error is None else "delivery_error",
+            detail="Matched the fixed Roblox game-pass URL rule; Gemini was not called.",
+            selected_name=selected_name,
+            response_text=ROBLOX_GAME_PASS_AUTOREPLY,
+            delivery_status=delivery_status,
+        )
+        if delivery_error is not None:
+            raise delivery_error
+
+    def _matches_ai_autoreply_trigger(self, ticket_text: str) -> bool:
+        """Check legacy application wording and per-rule must-mention terms."""
+        has_legacy_autoreply = False
+        for entry in (self.bot.config.get("autoreplies") or {}).values():
+            if isinstance(entry, Mapping):
+                if has_configured_trigger(ticket_text, entry.get("triggers") or []):
+                    return True
+            else:
+                has_legacy_autoreply = True
+        return has_legacy_autoreply and has_application_trigger(ticket_text)
+
+    def _resolve_ai_autoreplies(
+        self, ticket_text: str, *, require_trigger: bool = True
+    ) -> typing.Tuple[
+        typing.Dict[str, str], typing.Dict[str, typing.Dict[str, typing.Any]], typing.List[str]
+    ]:
+        """Resolve only rules whose required trigger matched the recipient message."""
+        choices = {}
+        alias_actions = {}
+        errors = []
+        aliases = getattr(self.bot, "aliases", {}) or {}
+
+        for key, entry in (self.bot.config.get("autoreplies") or {}).items():
+            if not isinstance(entry, Mapping):
+                if not require_trigger or has_application_trigger(ticket_text):
+                    choices[str(key)] = str(entry)
+                continue
+
+            if require_trigger and not has_configured_trigger(
+                ticket_text, entry.get("triggers") or []
+            ):
+                continue
+
+            variants = [
+                (
+                    str(entry.get("name") or key).strip(),
+                    str(entry.get("alias") or "").casefold().strip(),
+                )
+            ]
+            variants.extend(
+                (
+                    str(alternative.get("name") or "").strip(),
+                    str(alternative.get("alias") or "").casefold().strip(),
+                )
+                for alternative in (entry.get("alternatives") or [])
+                if isinstance(alternative, Mapping)
+            )
+
+            for display_name, alias_name in variants:
+                raw_alias = aliases.get(alias_name)
+                if not display_name or raw_alias is None:
+                    errors.append(f'Alias "{alias_name or key}" does not exist or has no name.')
+                    continue
+
+                steps = parse_reply_alias(raw_alias)
+                if steps is None:
+                    errors.append(
+                        f'Alias "{alias_name}" has no reply-style step with message text.'
+                    )
+                    continue
+
+                messages = []
+                try:
+                    for command, response_text in steps:
+                        if command in FORMATTED_AI_REPLY_COMMANDS:
+                            response_text = self.bot.formatter.format(
+                                response_text,
+                                channel=self.channel,
+                                recipient=self.recipient,
+                                author=self.bot.user,
+                            )
+                        from core.application_reading import describe_dynamic_reply
+
+                        messages.append(describe_dynamic_reply(response_text))
+                except Exception as exc:
+                    errors.append(
+                        f'Alias "{alias_name}" could not be formatted ({type(exc).__name__}).'
+                    )
+                    continue
+
+                combined_message = "\n\n".join(messages)
+                if len(combined_message) > 4_000:
+                    errors.append(
+                        f'Alias "{alias_name}" exceeds the 4,000-character autoreply limit.'
+                    )
+                    continue
+                if any(name.casefold() == display_name.casefold() for name in choices):
+                    errors.append(f'Autoreply display name "{display_name}" is duplicated.')
+                    continue
+                choices[display_name] = combined_message
+                alias_actions[display_name] = {
+                    "alias": alias_name,
+                    "group": str(key).strip(),
+                    "steps": parse_alias(raw_alias),
+                    "additional_info": str(entry.get("additional_info") or "").strip(),
+                }
+
+        return choices, alias_actions, errors
+
+    async def _invoke_ai_alias_step(self, step: str, source_message) -> None:
+        """Invoke one configured non-reply alias step as a system-authored command."""
+        view = StringView(self.bot.prefix + step)
+        # Intake messages may already be wrapped in DummyMessage. Copying that proxy makes
+        # copy.copy probe attributes through __getattr__ while reconstructing it, recursively
+        # delegating before _message exists. Always clone the underlying Discord message.
+        original_message = source_message
+        while isinstance(original_message, DummyMessage):
+            original_message = original_message._message
+        synthetic = DummyMessage(copy.copy(original_message))
+        synthetic.author = self.bot.modmail_guild.me or self.bot.user
+        synthetic.channel = self.channel
+        synthetic.guild = self.channel.guild
+        synthetic.content = self.bot.prefix + step
+        setattr(synthetic, "_ai_autoreply", True)
+
+        ctx = commands.Context(
+            prefix=self.bot.prefix,
+            view=view,
+            bot=self.bot,
+            message=synthetic,
+        )
+        ctx.thread = self
+        discord.utils.find(view.skip_string, await self.bot.get_prefix())
+        ctx.invoked_with = view.get_word().lower()
+        registered_command = self.bot.all_commands.get(ctx.invoked_with)
+        setattr(ctx, "_ai_autoreply", True)
+        if registered_command is None:
+            raise commands.CommandNotFound(f'Alias step command "{ctx.invoked_with}" was not found.')
+        # Autoreply aliases are administrator-configured system workflows. Run their non-reply
+        # steps with the same trusted permission bypass used by menu-invoked aliases, while still
+        # retaining converters and surfacing command errors to the caller. Copy the command before
+        # replacing its checks: mutating the registered command could affect normal commands or a
+        # second ticket executing at the same time.
+        ctx.command = registered_command.copy()
+        # discord.py's Command.copy() deliberately produces an unbound command. Reattach the
+        # loaded cog so callbacks such as Modmail.subscribe receive both ``self`` and ``ctx``.
+        ctx.command.cog = registered_command.cog
+        ctx.command.checks = [checks.has_permissions_predicate(PermissionLevel.INVALID)]
+        await ctx.command.invoke(ctx)
+
+    async def _execute_ai_alias(
+        self,
+        display_name: str,
+        alias_action,
+        source_message,
+        *,
+        form_fills: typing.Optional[typing.Mapping[str, str]] = None,
+    ) -> None:
+        """Execute every alias step in order while preserving the AI footer on replies."""
+        if str(alias_action.get("alias") or "").strip().casefold() in {
+            "subqual",
+            "subqualification",
+        }:
+            self._pending_subqual_request = {
+                "YOUR DISCORD USERNAME": str(getattr(self.recipient, "name", "") or "").strip()
+            }
+        action_errors = []
+        for step in alias_action["steps"]:
+            try:
+                parts = step.strip().split(maxsplit=1)
+                command = parts[0].casefold() if parts else ""
+                if command in SAFE_AI_REPLY_COMMANDS and len(parts) == 2 and parts[1].strip():
+                    response_text = parts[1].strip()
+                    if command in FORMATTED_AI_REPLY_COMMANDS:
+                        response_text = self.bot.formatter.format(
+                            response_text,
+                            channel=self.channel,
+                            recipient=self.recipient,
+                            author=self.bot.user,
+                        )
+
+                    response_text, no_fill_reason = await self._autofill_alias_form(
+                        response_text,
+                        source_message,
+                        form_fills=form_fills,
+                    )
+
+                    if self._pending_subqual_request is not None:
+                        for label in (
+                            "YOUR ROBLOX USERNAME",
+                            "YOUR DISCORD USERNAME",
+                            "MAIN DEPARTMENT",
+                            "DESIRED SUB DEPARTMENT",
+                            "CURRENTLY HOLD A SUB-QUAL? (Y/N)",
+                        ):
+                            match = re.search(
+                                rf"(?im)^\s*`*\s*{re.escape(label)}\s*:\s*`*\s*(.+?)\s*`*\s*$",
+                                response_text,
+                            )
+                            if match and match.group(1).strip():
+                                self._pending_subqual_request[label] = match.group(1).strip()
+
+                    await self._send_ai_autoreply(display_name, response_text)
+                    if no_fill_reason:
+                        await self.channel.send(
+                            no_fill_reason,
+                            allowed_mentions=discord.AllowedMentions.none(),
+                        )
+                    continue
+                await self._invoke_ai_alias_step(step, source_message)
+            except Exception as exc:
+                # One broken action must not prevent the remaining administrator-configured
+                # actions from running. Report all failures after the complete chain is attempted.
+                logger.exception("AI alias step failed: %s", step)
+                action_errors.append(f'"{step}": {type(exc).__name__}: {exc}')
+
+        if action_errors:
+            raise commands.CommandError(
+                "One or more AI alias actions failed after all steps were attempted: "
+                + "; ".join(action_errors)
+            )
+
+    async def _autofill_alias_form(
+        self,
+        response_text: str,
+        source_message,
+        *,
+        form_fills: typing.Optional[typing.Mapping[str, str]] = None,
+    ) -> typing.Tuple[str, typing.Optional[str]]:
+        """Auto-fill blank fenced form fields from explicit recipient ticket context."""
+        fields = extract_blank_form_fields(response_text)
+        if not fields:
+            return response_text, None
+        recipient_username = str(getattr(self.recipient, "name", "") or "").strip()
+        source_author = getattr(source_message, "author", None)
+        if (
+            not recipient_username
+            and getattr(source_author, "id", None) == self.id
+        ):
+            recipient_username = str(getattr(source_author, "name", "") or "").strip()
+        if not recipient_username:
+            cached_recipient = self.bot.get_user(self.id)
+            recipient_username = str(
+                getattr(cached_recipient, "name", "") or ""
+            ).strip()
+        if not recipient_username:
+            try:
+                fetched_recipient = await self.bot.get_or_fetch_user(self.id)
+            except Exception:
+                logger.warning(
+                    "Could not resolve the recipient username for form autofill.",
+                    exc_info=True,
+                )
+            else:
+                recipient_username = str(
+                    getattr(fetched_recipient, "name", "") or ""
+                ).strip()
+                if fetched_recipient is not None and self._recipient is None:
+                    self._recipient = fetched_recipient
+        if not recipient_username:
+            try:
+                username_log = await self.bot.api.get_log(self.channel.id)
+                recipient_data = (username_log or {}).get("recipient") or {}
+                recipient_username = str(
+                    recipient_data.get("name")
+                    or recipient_data.get("username")
+                    or ""
+                ).strip()
+            except Exception:
+                logger.warning(
+                    "Could not load the stored recipient username for form autofill.",
+                    exc_info=True,
+                )
+        trusted_fills = recipient_username_form_fills(fields, recipient_username)
+
+        def render_fills(fills):
+            rendered = apply_form_autofills(response_text, fills)
+            return enforce_recipient_discord_username(rendered, recipient_username)
+
+        if form_fills is not None:
+            combined_fills = dict(trusted_fills)
+            combined_fills.update(form_fills)
+            if not combined_fills:
+                return response_text, "No fields filled: No relevant information provided."
+            return render_fills(combined_fills), None
+
+        remaining_fields = [
+            field for field in fields if field["field_id"] not in trusted_fills
+        ]
+        if not remaining_fields:
+            return render_fills(trusted_fills), None
+        api_key = self.bot.config.get("gemini_api_key", convert=False)
+        if not api_key or self.bot.session is None:
+            if trusted_fills:
+                return render_fills(trusted_fills), None
+            return response_text, "No fields filled: Gemini is unavailable."
+        try:
+            log_entry = await self.bot.api.get_log(self.channel.id)
+            from core.ai_sorter import build_sorting_transcript
+
+            transcript = build_sorting_transcript(
+                (log_entry or {}).get("messages") or [],
+                bot_user_id=self.bot.user.id,
+            )
+            current_text = build_ticket_text(source_message)
+            if current_text:
+                transcript += "\n\n---\n\n[CURRENT RECIPIENT MESSAGE]\n" + current_text
+        except Exception:
+            logger.warning("Could not build alias form-autofill context.", exc_info=True)
+            if trusted_fills:
+                return render_fills(trusted_fills), None
+            return response_text, "No fields filled: Ticket context could not be loaded."
+
+        reviewer = GeminiFormAutofill(
+            self.bot.session,
+            str(api_key),
+            model=AI_INTAKE_MODEL,
+        )
+        fills = await reviewer.identify_fills(transcript, remaining_fields)
+        combined_fills = dict(trusted_fills)
+        combined_fills.update(fills or {})
+        if combined_fills:
+            return render_fills(combined_fills), None
+        if fills is None:
+            return response_text, "No fields filled: Gemini form checking failed."
+        return response_text, "No fields filled: No relevant information provided."
+
+    async def _run_ai_review(self, message, ticket_text: str) -> None:
+        """Run Gemini for one qualifying recipient message, failing open on every error."""
+
+        is_initial_message = self._initial_message_id == getattr(message, "id", None)
+        fallback_status = (
+            "No AI reply sent; the normal ticket-opened message was used."
+            if is_initial_message
+            else "No AI reply sent; the existing ticket continued normally."
+        )
+        autoreplies, alias_actions, configuration_errors = self._resolve_ai_autoreplies(ticket_text)
+        if autoreplies:
+            try:
+                sent_types = await self.bot.api.get_ai_autoreplies_sent(self.channel.id)
+            except Exception:
+                # The atomic claim below remains authoritative, so a read failure is safe. It only
+                # means Gemini may select a duplicate which the claim will then suppress.
+                sent_types = set()
+                logger.warning(
+                    "Failed to pre-load sent AI autoreply types; using the atomic guard only.",
+                    exc_info=True,
+                )
+            else:
+                matching_types = {
+                    name: resolve_ai_autoreply_type(name, alias_actions.get(name))
+                    for name in autoreplies
+                }
+                autoreplies = {
+                    name: response
+                    for name, response in autoreplies.items()
+                    if matching_types[name] not in sent_types
+                }
+                if not autoreplies:
+                    await self._log_ai_check(
+                        message,
+                        ticket_text,
+                        outcome="duplicate_suppressed",
+                        detail="Every matching autoreply type was already sent in this ticket.",
+                        delivery_status=(
+                            "Duplicate suppressed; no Gemini request, AI reply, or alias command "
+                            "was run."
+                        ),
+                    )
+                    return
+        api_key = self.bot.config.get("gemini_api_key", convert=False)
+        if not autoreplies:
+            await self._log_ai_check(
+                message,
+                ticket_text,
+                outcome="configuration_error" if configuration_errors else "skipped",
+                detail=(
+                    " ".join(configuration_errors)
+                    if configuration_errors
+                    else "No autoreplies are configured."
+                ),
+                delivery_status=fallback_status,
+            )
+            return
+        if not api_key or self.bot.session is None:
+            await self._log_ai_check(
+                message,
+                ticket_text,
+                outcome="configuration_error",
+                detail="Gemini API credentials or the HTTP session are unavailable.",
+                delivery_status=fallback_status,
+            )
+            return
+
+        reviewer = GeminiAutoReplyReviewer(
+            self.bot.session,
+            str(api_key),
+            model=AI_INTAKE_MODEL,
+        )
+        try:
+            log_entry = await self.bot.api.get_log(self.channel.id)
+            context_log_messages = (log_entry or {}).get("messages") or []
+        except Exception:
+            context_log_messages = []
+            logger.warning(
+                "Failed to load the complete ticket context for Gemini autoreply classification.",
+                exc_info=True,
+            )
+        context_messages = build_autoreply_context(
+            context_log_messages,
+            current_message_id=getattr(message, "id", None),
+            bot_user_id=self.bot.user.id,
+        )
+        selected = await reviewer.classify(
+            ticket_text,
+            autoreplies,
+            context_messages=context_messages,
+            selection_guidance={
+                name: action.get("additional_info", "")
+                for name, action in alias_actions.items()
+            },
+            alias_names={
+                name: action.get("alias", "")
+                for name, action in alias_actions.items()
+            },
+        )
+        response_text = autoreplies.get(selected) if selected is not None else None
+        delivery_error = None
+        if selected is not None:
+            alias_action = alias_actions.get(selected)
+            if self._is_flightnotlogged_alias(alias_action):
+                if (
+                    self._opening_workflow_active or self._opening_intake_pending
+                ) and not self._opening_introduction_sent:
+                    await self._send_ai_autoreply(
+                        "Opening AI introduction",
+                        "Hello. I am an AI assistant and I will be helping you today.",
+                        author_name="AI assistant",
+                        footer_text=AI_HELLO_FOOTER,
+                    )
+                    self._opening_introduction_sent = True
+                await self._request_flightnotlogged_confirmation(
+                    selected,
+                    alias_action,
+                    response_text,
+                    message,
+                    form_fills=reviewer.last_form_fills,
+                )
+                await self._log_ai_check(
+                    message,
+                    ticket_text,
+                    outcome="confirmation_required",
+                    detail="The flightnotlogged alias is awaiting recipient confirmation.",
+                    selected_name=selected,
+                    delivery_status="Eligibility confirmation sent; alias actions deferred.",
+                )
+                return
+            autoreply_type = resolve_ai_autoreply_type(selected, alias_action)
+            try:
+                claimed = await self.bot.api.claim_ai_autoreply(
+                    self.channel.id,
+                    autoreply_type,
+                    selected,
+                )
+            except Exception as exc:
+                logger.error(
+                    "AI autoreply blocked because its durable duplicate guard failed.",
+                    exc_info=True,
+                )
+                await self._log_ai_check(
+                    message,
+                    ticket_text,
+                    outcome="duplicate_guard_error",
+                    detail=(
+                        f"Gemini selected `{selected}`, but the durable duplicate guard failed "
+                        f"({type(exc).__name__})."
+                    ),
+                    selected_name=selected,
+                    delivery_status=(
+                        "No AI reply sent and no alias commands run because duplicate safety "
+                        "could not be confirmed."
+                    ),
+                )
+                return
+
+            if not claimed:
+                await self._log_ai_check(
+                    message,
+                    ticket_text,
+                    outcome="duplicate_suppressed",
+                    detail=(
+                        f"Autoreply type `{autoreply_type}` was already sent in this ticket."
+                    ),
+                    selected_name=selected,
+                    delivery_status=(
+                        "Duplicate suppressed; no AI reply was sent and no alias commands were run."
+                    ),
+                )
+                return
+
+            try:
+                if (
+                    self._opening_workflow_active or self._opening_intake_pending
+                ) and not self._opening_introduction_sent:
+                    await self._send_ai_autoreply(
+                        "Opening AI introduction",
+                        "Hello. I am an AI assistant and I will be helping you today.",
+                        author_name="AI assistant",
+                        footer_text=AI_HELLO_FOOTER,
+                    )
+                    self._opening_introduction_sent = True
+                if alias_action is None:
+                    await self._send_ai_autoreply(selected, response_text)
+                else:
+                    await self._execute_ai_alias(
+                        selected,
+                        alias_action,
+                        message,
+                        form_fills=reviewer.last_form_fills,
+                    )
+                self._opening_autoreply_sent = True
+                actual_subscribers = self.bot.config["subscriptions"].get(str(self.id), [])
+                self._opening_alias_subscribed = bool(
+                    actual_subscribers
+                    or (
+                        alias_action
+                        and any(
+                            step.strip().casefold().startswith("sub ")
+                            for step in alias_action.get("steps", [])
+                        )
+                    )
+                )
+                if not self._opening_alias_subscribed:
+                    if alias_action is not None:
+                        self._intake_collecting = False
+                        self._intake_handed_to_agent = True
+                        if not (
+                            self._pending_application_username_check
+                            or self._pending_subqual_request is not None
+                        ):
+                            await self._run_automatic_aiall()
+                    else:
+                        self._intake_collecting = True
+                        self.schedule_informative_autoreply_rescan(message)
+                if alias_action is not None:
+                    delivery_status = f'AI alias `{alias_action["alias"]}` executed in full.'
+                    if is_initial_message:
+                        delivery_status += " This occurred after the connected ticket-opened message."
+                elif is_initial_message:
+                    delivery_status = (
+                        "AI autoreply delivered after the connected ticket-opened message."
+                    )
+                else:
+                    delivery_status = "AI autoreply delivered after a recipient follow-up."
+            except Exception as exc:
+                delivery_error = exc
+                error_detail = describe_ai_error(exc)
+                delivery_status = f"AI autoreply delivery failed ({error_detail})."
+                logger.error(
+                    "AI autoreply delivery failed for selection %r: %s",
+                    selected,
+                    error_detail,
+                    exc_info=True,
+                )
+        else:
+            delivery_status = fallback_status
+
+        await self._log_ai_check(
+            message,
+            ticket_text,
+            outcome=reviewer.last_outcome,
+            detail=reviewer.last_detail or "",
+            selected_name=selected,
+            response_text=response_text,
+            delivery_status=delivery_status,
+        )
+        if delivery_error is not None:
+            raise delivery_error
+
     async def setup(self, *, creator=None, category=None, initial_message=None):
         """Create the thread channel and other io related initialisation tasks"""
+        if initial_message is not None:
+            self._initial_message_id = getattr(initial_message, "id", None)
         self.bot.dispatch("thread_initiate", self, creator, category, initial_message)
         recipient = self.recipient
+        user_created = initial_message is not None and (creator is None or creator == recipient)
+        if user_created:
+            await recipient.create_dm()
+            if self.bot.config.get("recipient_thread_close") and initial_message is not None:
+                close_emoji = await self.bot.convert_emoji(self.bot.config["close_emoji"])
+                await self.bot.add_reaction(initial_message, close_emoji)
 
         # in case it creates a channel outside of category
         overwrites = {self.bot.modmail_guild.default_role: discord.PermissionOverwrite(read_messages=False)}
@@ -833,8 +3076,6 @@ class Thread:
             log_url = log_count = None
             # ensure core functionality still works
 
-        self.ready = True
-
         if creator is not None and creator != recipient:
             mention = None
         else:
@@ -863,33 +3104,6 @@ class Thread:
                         )
             except Exception:
                 logger.error("Failed unexpectedly:", exc_info=True)
-
-        async def send_recipient_genesis_message():
-            # Once thread is ready, tell the recipient (don't send if using contact on others)
-            # Allow disabling the DM receipt embed via config
-            if not self.bot.config.get("thread_creation_send_dm_embed"):
-                # If self-closable is enabled, add the close reaction to the user's
-                # original message instead so functionality is preserved without an embed.
-                try:
-                    recipient_thread_close = self.bot.config.get("recipient_thread_close")
-                    if recipient_thread_close and initial_message is not None:
-                        close_emoji = self.bot.config["close_emoji"]
-                        close_emoji = await self.bot.convert_emoji(close_emoji)
-                        await self.bot.add_reaction(initial_message, close_emoji)
-                except Exception as e:
-                    logger.info("Failed to add self-close reaction to initial message: %s", e)
-                return
-
-            recipient_thread_close = self.bot.config.get("recipient_thread_close")
-
-            if creator is None or creator == recipient:
-                await recipient.create_dm()
-                msg = await send_ticket_opened(recipient)
-
-                if recipient_thread_close and msg is not None:
-                    close_emoji = self.bot.config["close_emoji"]
-                    close_emoji = await self.bot.convert_emoji(close_emoji)
-                    await self.bot.add_reaction(msg, close_emoji)
 
         async def send_persistent_notes():
             notes = await self.bot.api.find_notes(self.recipient)
@@ -927,6 +3141,8 @@ class Thread:
 
         async def activate_auto_triggers():
             if initial_message:
+                if self.contains_abusive_message(initial_message):
+                    return
                 message = DummyMessage(copy.copy(initial_message))
 
                 try:
@@ -934,12 +3150,31 @@ class Thread:
                 except RuntimeError:
                     pass
 
+        # The recipient information/genesis embed must always be the first channel message.
+        await send_genesis_message()
+        if user_created and self.bot.config.get("gemini_ai_enabled"):
+            try:
+                await self._send_ai_autoreply(
+                    "AI assistance introduction",
+                    AI_INTAKE_GREETING,
+                    author_name="AI assistant",
+                    footer_text=AI_HELLO_FOOTER,
+                )
+                self._opening_introduction_sent = True
+                self._intake_collecting = True
+            except Exception:
+                logger.warning(
+                    "Could not send the AI intake introduction; continuing normal handling.",
+                    exc_info=True,
+                )
         await asyncio.gather(
-            send_genesis_message(),
-            send_recipient_genesis_message(),
             activate_auto_triggers(),
             send_persistent_notes(),
         )
+        if user_created:
+            # Block follow-up workflows before the first relayed message dispatches its listener.
+            self._opening_intake_pending = True
+        self.ready = True
         self.bot.dispatch("thread_ready", self, creator, category, initial_message)
 
     def _format_info_embed(self, user, log_url, log_count, color):
@@ -1032,6 +3267,14 @@ class Thread:
     ) -> None:
         """Close a thread now or after a set time in seconds"""
 
+        closer_id = getattr(closer, "id", None)
+        bot_user_id = getattr(self.bot.user, "id", None)
+        if self._auto_close_check_active and closer_id != bot_user_id:
+            raise CommandError(
+                "DO NOT CLOSE - AUTO CHECKING. The ticket may be closed manually once "
+                "the automatic check has finished."
+            )
+
         # restarts the after timer
         await self.cancel_closure(auto_close)
 
@@ -1080,8 +3323,11 @@ class Thread:
 
         # Cancel auto closing the thread if closed by any means.
 
-        self.bot.config["subscriptions"].pop(str(self.id), None)
-        self.bot.config["notification_squad"].pop(str(self.id), None)
+        subscriptions_removed = self.bot.config["subscriptions"].pop(str(self.id), None)
+        notifications_removed = self.bot.config["notification_squad"].pop(str(self.id), None)
+        reminder_removed = self.bot.config["reply_reminders"].pop(str(self.id), None)
+        if any(item is not None for item in (subscriptions_removed, notifications_removed, reminder_removed)):
+            await self.bot.config.update()
 
         # Logging
         if self.channel:
@@ -1200,7 +3446,25 @@ class Thread:
                     embed.description = message
 
                 if user is not None:
-                    tasks.append(user.send(embed=embed))
+                    async def send_close_message(recipient=user):
+                        try:
+                            await recipient.send(embed=embed)
+                        except discord.Forbidden as exc:
+                            # A recipient may have left every mutual guild, blocked the bot,
+                            # or disabled DMs. Closing/logging the staff ticket must still finish.
+                            logger.info(
+                                "Could not deliver thread-close DM to recipient %s: %s",
+                                getattr(recipient, "id", "unknown"),
+                                exc,
+                            )
+                        except discord.NotFound as exc:
+                            logger.info(
+                                "Recipient %s was unavailable for thread-close DM: %s",
+                                getattr(recipient, "id", "unknown"),
+                                exc,
+                            )
+
+                    tasks.append(send_close_message())
 
         if delete_channel and self.channel:
             tasks.append(self.channel.delete())
@@ -1311,6 +3575,7 @@ class Thread:
         note: bool = True,
     ) -> typing.Tuple[discord.Message, typing.List[typing.Optional[discord.Message]]]:
         if message1 is not None:
+            is_ai_autoreply = self._is_ai_autoreply_message(message1)
             if note:
                 # For notes, don't require author.url; rely on footer/author.name markers
                 if not message1.embeds or message1.author != self.bot.user:
@@ -1321,7 +3586,7 @@ class Thread:
             else:
                 if (
                     not message1.embeds
-                    or not message1.embeds[0].author.url
+                    or (not message1.embeds[0].author.url and not is_ai_autoreply)
                     or message1.author != self.bot.user
                 ):
                     logger.debug(
@@ -1336,6 +3601,7 @@ class Thread:
             except discord.NotFound:
                 logger.warning(f"Message ID {message_id} not found in channel history.")
                 raise ValueError("Thread message not found.")
+            is_ai_autoreply = self._is_ai_autoreply_message(message1)
 
             if note:
                 # Try to treat as note/persistent note first
@@ -1356,7 +3622,7 @@ class Thread:
             # Non-note path (regular relayed messages): require author.url and colors
             if not (
                 message1.embeds
-                and message1.embeds[0].author.url
+                and (message1.embeds[0].author.url or is_ai_autoreply)
                 and message1.embeds[0].color
                 and message1.author == self.bot.user
             ):
@@ -1381,7 +3647,7 @@ class Thread:
                 raise ValueError("Thread message not found.")
         else:
             async for message1 in self.channel.history():
-                if (
+                is_linked_message = (
                     message1.embeds
                     and message1.embeds[0].author.url
                     and message1.embeds[0].color
@@ -1391,14 +3657,24 @@ class Thread:
                     )
                     and message1.embeds[0].author.url.split("#")[-1].isdigit()
                     and message1.author == self.bot.user
-                ):
+                )
+                is_legacy_ai_autoreply = (
+                    self._is_ai_autoreply_message(message1)
+                    and message1.embeds[0].color
+                    and message1.embeds[0].color.value == self.bot.mod_color
+                )
+                if is_linked_message or is_legacy_ai_autoreply:
                     break
             else:
                 raise ValueError("Thread message not found.")
 
+        author_url = getattr(message1.embeds[0].author, "url", None)
+        if not author_url and self._is_ai_autoreply_message(message1):
+            return await self._find_legacy_ai_autoreply_messages(message1)
+
         try:
-            joint_id = int(message1.embeds[0].author.url.split("#")[-1])
-        except ValueError:
+            joint_id = int(author_url.split("#")[-1])
+        except (AttributeError, ValueError):
             raise ValueError("Malformed thread message.")
 
         messages = [message1]
@@ -1466,7 +3742,14 @@ class Thread:
             tasks += [self.bot.api.delete_note(message1.id)]
 
         if tasks:
-            await asyncio.gather(*tasks)
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            unexpected_errors = [
+                result
+                for result in results
+                if isinstance(result, Exception) and not isinstance(result, discord.NotFound)
+            ]
+            if unexpected_errors:
+                raise unexpected_errors[0]
 
     async def find_linked_message_from_dm(
         self, message, either_direction=False, get_thread_channel=False
@@ -1594,6 +3877,26 @@ class Thread:
         Tuple[List[discord.Message], discord.Message]
             A list of messages sent to recipients and the copy sent in the thread channel.
         """
+        author = getattr(message, "_reply_authorizer", None) or getattr(
+            message, "author", None
+        )
+        trusted_system_reply = bool(
+            getattr(message, "_ai_autoreply", False)
+            or getattr(message, "_menu_invoked", False)
+            or getattr(author, "id", None) == getattr(self.bot.user, "id", None)
+        )
+        if not trusted_system_reply:
+            await self.ensure_staff_reply_subscription(author, message)
+
+        from core.application_reading import expand_application_reading
+
+        original_content = content if content is not None else message.content
+        content = await expand_application_reading(self.bot, original_content, recipient=self.recipient)
+        if content != original_content:
+            # Log the delivered schedule rather than the dynamic marker.
+            message = copy.copy(message)
+            message.content = content
+
         # If this thread was snoozed using move-behavior, unsnooze automatically when a mod replies
         try:
             behavior = (self.bot.config.get("snooze_behavior") or "delete").lower()
@@ -1721,8 +4024,46 @@ class Thread:
                 )
 
         await asyncio.gather(*tasks)
+
         self.bot.dispatch("thread_reply", self, True, message, anonymous, plain)
         return (user_msg, msg)  # sent_to_user, sent_to_thread_channel
+
+    async def ensure_staff_reply_subscription(self, author, source_message=None) -> None:
+        """Reject a human-authored recipient reply unless their user or role is subscribed."""
+        subscriptions = self.bot.config["subscriptions"].get(str(self.id), [])
+        author_id = getattr(author, "id", None)
+        if author_id in self._alias_subscription_bypass_authors:
+            return
+        if author_has_thread_subscription(subscriptions, author):
+            return
+        warning = (
+            f"**Subscription required**\nYou must run `{self.bot.prefix}sub` to subscribe "
+            "yourself, or subscribe a role you hold, before sending messages or using reply "
+            "aliases in this ticket."
+        )
+        author_id = author_id or 0
+        now = time.monotonic()
+        last_warning = self._subscription_warning_times.get(author_id, 0)
+        if now - last_warning >= 3:
+            self._subscription_warning_times[author_id] = now
+            reference_message = source_message
+            seen_proxies = set()
+            while (
+                reference_message is not None
+                and hasattr(reference_message, "_message")
+                and id(reference_message) not in seen_proxies
+            ):
+                seen_proxies.add(id(reference_message))
+                reference_message = reference_message._message
+            reference = None
+            if isinstance(reference_message, discord.Message):
+                reference = reference_message.to_reference(fail_if_not_exists=False)
+            await self.channel.send(
+                warning,
+                allowed_mentions=discord.AllowedMentions.none(),
+                reference=reference,
+            )
+        raise commands.CheckFailure(warning)
 
     async def send(
         self,
@@ -2094,6 +4435,38 @@ class Thread:
                 footer_text += " • Forwarded"
             embed.set_footer(text=footer_text)
             embed.colour = self.bot.recipient_color
+
+        if self.bot.config.get("message_embeds_v2"):
+            embed.timestamp = message.created_at
+            existing_footer = embed.footer.text if embed.footer else ""
+            if note:
+                embed.title = "Internal Support Note"
+                embed.colour = 0x5865F2
+                footer_prefix = "TUI Airways • Staff only"
+            elif from_mod:
+                embed.title = (
+                    "TUI Airways • Anonymous Staff Reply"
+                    if anonymous
+                    else "TUI Airways • Staff Reply"
+                )
+                embed.colour = 0xD40E14
+                footer_prefix = "TUI Airways Support"
+            else:
+                display_name = (
+                    getattr(author, "display_name", None)
+                    or getattr(author, "name", None)
+                    or "Recipient"
+                )
+                embed.title = f"Message from {display_name}"
+                embed.colour = 0x70CBF4
+                footer_prefix = "Recipient message"
+            embed.set_footer(
+                text=(
+                    f"{footer_prefix} • {existing_footer}"
+                    if existing_footer
+                    else footer_prefix
+                )
+            )
 
         if (from_mod or note) and not thread_creation:
             delete_message = not bool(message.attachments)
@@ -2855,6 +5228,9 @@ class ThreadManager:
                                     "Failed to add sent reaction to user's DM: %s",
                                     e,
                                 )
+                            if await self.outer_thread.auto_close_for_abuse(message):
+                                setattr(self.outer_thread, "_pending_menu", False)
+                                return
                             # Dispatch thread_reply event for parity
                             self.outer_thread.bot.dispatch(
                                 "thread_reply",

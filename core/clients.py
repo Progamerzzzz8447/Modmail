@@ -11,6 +11,7 @@ from aiohttp import ClientResponseError, ClientResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pymongo.errors import ConfigurationError
 
+from core.ai_reviewer import claim_ai_autoreply_once, normalize_ai_autoreply_type
 from core.models import InvalidConfigError, getLogger
 
 logger = getLogger(__name__)
@@ -373,6 +374,16 @@ class ApiClient:
     async def get_log(self, channel_id: Union[str, int]) -> dict:
         return NotImplemented
 
+    async def get_ai_autoreplies_sent(self, channel_id: Union[str, int]) -> set:
+        return NotImplemented
+
+    async def get_recent_log_messages(
+        self,
+        channel_id: Union[str, int],
+        limit: int = 25,
+    ) -> list:
+        return NotImplemented
+
     async def get_log_link(self, channel_id: Union[str, int]) -> str:
         return NotImplemented
 
@@ -577,6 +588,35 @@ class MongoDBClient(ApiClient):
         logger.debug("Retrieving channel %s logs.", channel_id)
         return await self.logs.find_one({"channel_id": str(channel_id)})
 
+    async def get_ai_autoreplies_sent(self, channel_id: Union[str, int]) -> set:
+        """Return the durable autoreply types already reserved for an open ticket."""
+        log = await self.logs.find_one(
+            {"channel_id": str(channel_id)},
+            {"ai_autoreplies_sent": 1},
+        )
+        if log is None:
+            raise RuntimeError("The ticket log does not exist for the AI duplicate guard.")
+        return {
+            normalize_ai_autoreply_type(value)
+            for value in (log.get("ai_autoreplies_sent") or [])
+            if normalize_ai_autoreply_type(value)
+        }
+
+    async def get_recent_log_messages(
+        self,
+        channel_id: Union[str, int],
+        limit: int = 25,
+    ) -> list:
+        """Return a small recent log slice for automatic-reply context construction."""
+        limit = max(int(limit), 1)
+        log = await self.logs.find_one(
+            {"channel_id": str(channel_id)},
+            {"messages": {"$slice": -limit}},
+        )
+        if log is None:
+            raise RuntimeError("The ticket log does not exist for AI context loading.")
+        return list(log.get("messages") or [])
+
     async def get_log_link(self, channel_id: Union[str, int]) -> str:
         doc = await self.get_log(channel_id)
         logger.debug("Retrieving log link for channel %s.", channel_id)
@@ -614,6 +654,7 @@ class MongoDBClient(ApiClient):
                 },
                 "closer": None,
                 "messages": [],
+                "ai_autoreplies_sent": [],
             }
         )
         logger.debug("Created a log entry, key %s.", key)
@@ -692,6 +733,26 @@ class MongoDBClient(ApiClient):
             {"channel_id": channel_id},
             {"$push": {"messages": data}},
             return_document=True,
+        )
+
+    async def claim_ai_autoreply(
+        self,
+        channel_id: Union[int, str],
+        autoreply_type: str,
+        display_name: str = "",
+    ) -> bool:
+        """Atomically reserve one autoreply type for a ticket.
+
+        The reservation is deliberately durable and is never automatically released. This
+        gives AI autoreplies at-most-once delivery even if an alias only partially executes,
+        two messages race, or the bot restarts.
+        """
+        return await claim_ai_autoreply_once(
+            self.logs,
+            channel_id,
+            autoreply_type,
+            display_name=display_name,
+            bot_user_id=self.bot.user.id,
         )
 
     async def post_log(self, channel_id: Union[int, str], data: dict) -> dict:

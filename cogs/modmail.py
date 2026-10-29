@@ -1,9 +1,16 @@
 import asyncio
+import copy
+import copy
 import re
-from datetime import datetime, timezone, timedelta
+import secrets
+from datetime import datetime, time as datetime_time, timezone, timedelta
+from io import BytesIO
 from itertools import zip_longest
 from typing import Optional, Union, List, Tuple, Literal
 import logging
+from pathlib import Path
+from types import SimpleNamespace
+from zoneinfo import ZoneInfo
 
 import discord
 from discord.ext import commands
@@ -16,13 +23,67 @@ from discord.utils import escape_markdown
 from dateutil import parser
 
 from core import checks
-from core.models import DMDisabled, PermissionLevel, SimilarCategoryConverter, getLogger
+from core.message_autofill import AUTOFILL_STAFF_USER_ID, expand_staff_reply_markers
+from core.alias_parser import (
+    AUTOREPLY_DISPLAY_NAME_LIMIT,
+    AUTOREPLY_TOTAL_CHOICE_LIMIT,
+    format_autoreply_rule_spec,
+    parse_autoreply_rule_spec,
+    parse_reply_alias,
+)
+from core.abuse_filter import (
+    ABUSE_AUTO_CLOSE_MESSAGE,
+    contains_abusive_language,
+    normalize_custom_abuse_term,
+)
+from core.ai_reviewer import (
+    AI_ALL_CLOSING,
+    AI_HELLO_FOOTER,
+    AI_HELLO_MESSAGES,
+    AI_REPLY_CLOSING,
+    AI_REPLY_FOOTER,
+    AI_TEST_HUMAN_MARKER,
+    AI_TICKET_CLOSED_MESSAGE,
+    AI_TEXT_ATTACHMENT_MAX_BYTES,
+    AI_TEXT_ATTACHMENT_EXTENSIONS,
+    GeminiAnnoyReplyGenerator,
+    GeminiContinuousTestReplyGenerator,
+    GeminiHelpfulReplyGenerator,
+    GeminiTicketChannelSummaryGenerator,
+    GeminiTicketSummaryGenerator,
+    NO_MATCH,
+    build_relayed_reply_transcript,
+    decode_ai_text_attachment,
+    find_command_references,
+    finalize_generated_ai_reply,
+    last_relayed_message_is_human_staff,
+    is_acknowledgement_only,
+    parse_aireply_argument,
+)
+from core.ai_sorter import (
+    DEFAULT_GEMINI_REVIEW_MODEL,
+    GeminiTicketBatchReviewer,
+    build_sorting_transcript,
+    latest_conversation_has_closing,
+    ticket_is_rename_eligible,
+)
+from core.models import DummyMessage, DMDisabled, PermissionLevel, SimilarCategoryConverter, getLogger
 from core.paginator import EmbedPaginatorSession
 from core.thread import Thread
 from core.time import UserFriendlyTime, human_timedelta
 from core.utils import *
 
 logger = getLogger(__name__)
+
+MANUAL_AI_ROLE_IDS = (1391515982417100951, 1516405254571298866, 1531741911784624238)
+HR_CASE_ROLE_ID = 1442902654035562571
+RESOLVED_CATEGORY_ID = 1369044841366814871
+AI_CLOSE_MESSAGE = AI_TICKET_CLOSED_MESSAGE
+DEFAULT_SMART_AI_CONTEXT_PATH = Path(__file__).resolve().parent.parent / "core" / "smart_ai_context.md"
+AI_SORT_TIMES = (
+    datetime_time(hour=6, tzinfo=ZoneInfo("Europe/London")),
+    datetime_time(hour=18, minute=25, tzinfo=ZoneInfo("Europe/London")),
+)
 
 
 class Modmail(commands.Cog):
@@ -31,7 +92,493 @@ class Modmail(commands.Cog):
     def __init__(self, bot):
         self.bot = bot
         self._snoozed_cache = []
+        self._ai_sort_lock = asyncio.Lock()
+        self._ai_test_threads = set()
+        self._ai_test_locks = {}
         self._auto_unsnooze_task = self.bot.loop.create_task(self.auto_unsnooze_task())
+
+    @commands.Cog.listener()
+    async def on_thread_reply(self, thread, from_mod, message, anonymous, plain):
+        """Run eligible automatic replies and track unanswered recipient follow-ups."""
+        key = str(thread.id)
+        reminders = self.bot.config["reply_reminders"]
+
+        if from_mod:
+            if reminders.pop(key, None) is not None:
+                await self.bot.config.update()
+            return
+
+        is_initial = getattr(thread, "_initial_message_id", None) == getattr(message, "id", None)
+        if is_initial:
+            try:
+                await thread.begin_opening_intake_workflow(message)
+            except Exception:
+                logger.warning(
+                    "AI opening intake workflow failed.",
+                    exc_info=True,
+                )
+            finally:
+                if key in self._ai_test_threads and (
+                    getattr(thread, "_opening_alias_subscribed", False)
+                    or getattr(thread, "_intake_handed_to_agent", False)
+                ):
+                    self._ai_test_threads.discard(key)
+            return
+
+        # Any recipient response supersedes the five-minute quiet-ticket timer. The ordinary
+        # intake branch below immediately reassesses the new message and complete transcript.
+        thread.cancel_informative_autoreply_rescan()
+        thread._ai_form_sent_revision = None
+
+        if await thread.handle_pending_subqual_request(message):
+            return
+
+        if await thread.handle_pending_application_username_check(message):
+            return
+
+        # A flightnotlogged selection is a two-stage workflow. Its confirmation must be handled
+        # before opening-window, subscription, test-mode, or ordinary autoreply routing.
+        if await thread.handle_flightnotlogged_confirmation(message):
+            return
+
+        # Once AI ALL has asked whether anything else is needed, a recipient's explicit
+        # acknowledgement (including "that is all") should run the immediate AIBYE close flow.
+        if getattr(thread, "_all_closure_alias_ran", False) and is_acknowledgement_only(
+            getattr(message, "content", "")
+        ):
+            try:
+                await thread.begin_acknowledgement_closure_workflow(message)
+            except Exception:
+                logger.warning("AI acknowledgement closure workflow failed.", exc_info=True)
+            return
+
+        # Any substantive reply after AI ALL is a new enquiry. Remove the old resolution's
+        # scheduled closure/subscription, then assess this message with the full intake path.
+        post_aiall_new_inquiry = getattr(thread, "_all_closure_alias_ran", False)
+        if post_aiall_new_inquiry:
+            await thread.restart_intake_after_aiall()
+
+        # Messages sent during the opening observation window are already relayed live and included
+        # in its combined AI context. This guard must run before continuous test mode so ?aitest
+        # cannot race the opening sequence and send an alias before the AI introduction.
+        if not post_aiall_new_inquiry and getattr(thread, "_opening_intake_pending", False):
+            if not getattr(thread, "_opening_collection_open", False):
+                thread._pending_followup_message = message
+            return
+
+        if not post_aiall_new_inquiry and key in self._ai_test_threads:
+            try:
+                await self._run_ai_test_cycle(thread, message)
+            except Exception:
+                logger.error("Continuous AI test cycle failed.", exc_info=True)
+                self._ai_test_threads.discard(key)
+                await thread.channel.send(
+                    "AI test stopped because its reply cycle failed; human assistance is required."
+                )
+            return
+
+        subscribers = self.bot.config["subscriptions"].get(key, [])
+        if post_aiall_new_inquiry:
+            try:
+                await thread.begin_followup_autoreply_workflow(
+                    message,
+                    full_intake=True,
+                )
+            except Exception:
+                logger.warning("AI post-aiall new-ticket intake failed.", exc_info=True)
+        elif subscribers or getattr(thread, "_opening_alias_subscribed", False):
+            thread._intake_collecting = False
+            thread._intake_handed_to_agent = True
+            # A subscription hands the conversation to a person, but it must not disable
+            # unrelated configured autoreplies for every later recipient message. Keep this
+            # pass autoreply-only so the intake assistant cannot resume or issue a second
+            # handoff while the durable per-type claims still suppress duplicate replies.
+            try:
+                await thread.begin_followup_autoreply_workflow(message)
+            except Exception:
+                logger.warning(
+                    "AI ticket review failed for a subscribed recipient follow-up.",
+                    exc_info=True,
+                )
+        elif getattr(thread, "_awaiting_initial_inquiry", False) or getattr(
+            thread, "_intake_collecting", False
+        ):
+            try:
+                await thread.begin_followup_autoreply_workflow(
+                    message,
+                    full_intake=True,
+                )
+            except Exception:
+                logger.warning("AI initial-inquiry follow-up failed.", exc_info=True)
+        else:
+            try:
+                # Every later recipient message is eligible for configured keyword autoreplies,
+                # even after intake has handed the ticket to a human. Subscribed tickets remain
+                # excluded by the branch above.
+                await thread.begin_followup_autoreply_workflow(message)
+            except Exception:
+                logger.warning(
+                    "AI ticket review failed for a recipient follow-up.",
+                    exc_info=True,
+                )
+
+        # The opening ticket message has its own normal notification flow. The
+        # 12-hour reminder begins only when the recipient subsequently replies.
+        try:
+            delay = int(self.bot.config.get("recipient_reply_reminder_delay") or 43_200)
+        except (TypeError, ValueError):
+            delay = 43_200
+        delay = max(delay, 1)
+        reminders[key] = {
+            "due_at": (datetime.now(timezone.utc) + timedelta(seconds=delay)).isoformat(),
+            "message_id": str(getattr(message, "id", "")),
+        }
+        await self.bot.config.update()
+
+    async def _run_ai_test_cycle(self, thread, message):
+        """Process one recipient turn while continuous AI test mode is active."""
+        key = str(thread.id)
+        lock = self._ai_test_locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            if key not in self._ai_test_threads:
+                return
+            if getattr(thread, "_opening_intake_pending", False):
+                # The normal opener owns hello -> alias -> resolution/aiall ordering.
+                return
+
+            # Configured deterministic/Gemini-selected aliases take priority over a generated
+            # answer. They retain their normal duplicate guard and execute every configured step.
+            await thread.consider_ai_autoreply(message)
+            subscribers = self.bot.config["subscriptions"].get(key, [])
+            if subscribers or getattr(thread, "_opening_alias_subscribed", False):
+                self._ai_test_threads.discard(key)
+                await thread.channel.send(
+                    "AI test stopped: an autoreply alias subscribed a user or role."
+                )
+                await thread.channel.send("**You may now reply**")
+                return
+            if getattr(thread, "_opening_autoreply_sent", False):
+                # Do not stack a generated answer on top of an autoreply. Keep test mode enabled
+                # and assess the recipient's next turn instead.
+                return
+
+            api_key = self.bot.config.get("gemini_api_key", convert=False)
+            if not api_key or self.bot.session is None:
+                self._ai_test_threads.discard(key)
+                await thread.channel.send(
+                    "AI test stopped: Gemini is unavailable; human assistance is required."
+                )
+                await thread.channel.send("**You may now reply**")
+                return
+
+            log_entry = await self.bot.api.get_log(thread.channel.id)
+            transcript = build_sorting_transcript(
+                (log_entry or {}).get("messages") or [],
+                bot_user_id=self.bot.user.id,
+            )
+            generator = GeminiContinuousTestReplyGenerator(
+                self.bot.session,
+                str(api_key),
+                model=str(self.bot.config.get("gemini_model") or "gemini-3.5-flash-lite"),
+                timeout_seconds=30,
+            )
+            response = await generator.generate(transcript)
+            if response is None:
+                self._ai_test_threads.discard(key)
+                await thread._log_ai_check(
+                    message,
+                    transcript,
+                    outcome=generator.last_outcome,
+                    detail=generator.last_detail or "Continuous AI test generation failed.",
+                    selected_name="aitest",
+                    delivery_status="AI test stopped; awaiting human assistance.",
+                )
+                await thread.channel.send(
+                    "AI test stopped because Gemini could not produce a safe response."
+                )
+                await thread.channel.send("**You may now reply**")
+                return
+
+            if response.casefold().startswith(AI_TEST_HUMAN_MARKER.casefold()):
+                reason = response[len(AI_TEST_HUMAN_MARKER) :].strip() or "Human action is required."
+                self._ai_test_threads.discard(key)
+                handoff = (
+                    "I have requested a human agent to assist with your inquiry. "
+                    "Please patiently await their assistance."
+                )
+                await thread._send_ai_autoreply("AI test human handoff", handoff)
+                await thread._log_ai_check(
+                    message,
+                    transcript,
+                    outcome="human_assistance_required",
+                    detail=reason,
+                    selected_name="aitest",
+                    response_text=handoff,
+                    delivery_status="AI test stopped and requested human assistance.",
+                )
+                await thread.channel.send(f"AI test stopped — human assistance required: {reason}")
+                await thread.channel.send("**You may now reply**")
+                return
+
+            response = finalize_generated_ai_reply(
+                response,
+                include_closing=False,
+                maximum_length=4_000,
+            )
+            await thread._send_ai_autoreply("Continuous AI test reply", response)
+            await thread._log_ai_check(
+                message,
+                transcript,
+                outcome=generator.last_outcome,
+                detail=generator.last_detail or "Generated a continuous AI test reply.",
+                selected_name="aitest",
+                response_text=response,
+                delivery_status="Continuous AI test reply delivered; mode remains active.",
+            )
+
+    @tasks.loop(minutes=1)
+    async def unanswered_reply_reminders(self):
+        """Ping a ticket's subscribers once when a recipient follow-up waits 12 hours."""
+        now = datetime.now(timezone.utc)
+        reminders = self.bot.config["reply_reminders"]
+        changed = False
+
+        for recipient_id, reminder in tuple(reminders.items()):
+            try:
+                due_at = datetime.fromisoformat(reminder["due_at"])
+                if due_at.tzinfo is None:
+                    due_at = due_at.replace(tzinfo=timezone.utc)
+            except (KeyError, TypeError, ValueError):
+                reminders.pop(recipient_id, None)
+                changed = True
+                continue
+
+            if due_at > now:
+                continue
+
+            try:
+                thread = await self.bot.threads.find(recipient_id=int(recipient_id))
+            except Exception:
+                logger.warning("Failed to resolve thread %s for its reply reminder.", recipient_id)
+                continue
+
+            # A newer recipient message or staff response may have updated the
+            # reminder while thread lookup yielded control.
+            if reminders.get(recipient_id) != reminder:
+                continue
+
+            if thread is None or thread.channel is None:
+                reminders.pop(recipient_id, None)
+                changed = True
+                continue
+
+            subscribers = self.bot.config["subscriptions"].get(recipient_id, [])
+            mentions = " ".join(dict.fromkeys(subscribers))
+            if not mentions:
+                reminders.pop(recipient_id, None)
+                changed = True
+                continue
+
+            reminder_text = self.bot.config.get("recipient_reply_reminder_text")
+            try:
+                await thread.channel.send(f"{mentions} {reminder_text}")
+            except Exception:
+                logger.warning("Failed to send reply reminder for thread %s.", recipient_id, exc_info=True)
+                continue
+
+            if reminders.get(recipient_id) == reminder:
+                reminders.pop(recipient_id, None)
+                changed = True
+
+        if changed:
+            await self.bot.config.update()
+
+    @unanswered_reply_reminders.before_loop
+    async def before_unanswered_reply_reminders(self):
+        await self.bot.wait_until_ready()
+
+    async def _log_ai_sort(self, title: str, description: str, *, fields=None, error=False) -> None:
+        """Write a Gemini batch-review audit entry to the former Groq log channel."""
+        channel_id = self.bot.config.get("ai_sort_log_channel_id", convert=False)
+        try:
+            channel_id = int(channel_id)
+        except (TypeError, ValueError):
+            logger.warning("AI sort log channel is not configured.")
+            return
+        channel = self.bot.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except Exception:
+                logger.warning("Could not fetch AI sort log channel %s.", channel_id, exc_info=True)
+                return
+        embed = discord.Embed(
+            title=title,
+            description=description[:4_096],
+            color=self.bot.error_color if error else self.bot.main_color,
+            timestamp=datetime.now(timezone.utc),
+        )
+        for name, value in fields or ():
+            embed.add_field(name=str(name)[:256], value=str(value or "—")[:1_024], inline=False)
+        try:
+            await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+        except Exception:
+            logger.warning("Could not write an AI sort audit entry.", exc_info=True)
+
+    async def _run_ai_sort(self, *, trigger: str, only_thread=None) -> Tuple[int, int]:
+        """Review every open ticket using exactly one Gemini API request."""
+        api_key = self.bot.config.get("gemini_api_key", convert=False)
+        if not api_key or self.bot.session is None:
+            await self._log_ai_sort(
+                "Gemini ticket review unavailable",
+                "`GEMINI_API_KEY` is not configured, so no tickets were reviewed.",
+                fields=[("Trigger", trigger)],
+                error=True,
+            )
+            raise commands.CommandError("Gemini API credentials are not configured.")
+
+        async with self._ai_sort_lock:
+            configured_model = str(
+                self.bot.config.get("ai_sort_model") or DEFAULT_GEMINI_REVIEW_MODEL
+            )
+            if configured_model == "gemini-2.5-flash-lite":
+                configured_model = DEFAULT_GEMINI_REVIEW_MODEL
+            reviewer = GeminiTicketBatchReviewer(
+                self.bot.session,
+                str(api_key),
+                model=configured_model,
+            )
+            if only_thread is not None:
+                threads = [only_thread]
+            else:
+                await self.bot.threads.populate_cache()
+                unique = {}
+                for thread in self.bot.threads.cache.values():
+                    channel = getattr(thread, "channel", None)
+                    if (
+                        isinstance(channel, discord.TextChannel)
+                        and not getattr(thread, "snoozed", False)
+                        and not getattr(thread, "cancelled", False)
+                    ):
+                        unique[channel.id] = thread
+                threads = list(unique.values())
+
+            ticket_data = []
+            contexts = {}
+            for thread in threads:
+                channel = thread.channel
+                try:
+                    log_entry = await self.bot.api.get_log(channel.id)
+                    log_messages = (log_entry or {}).get("messages") or []
+                except Exception:
+                    logger.warning("Could not load ticket %s for Gemini review.", channel.id, exc_info=True)
+                    continue
+                transcript = build_sorting_transcript(log_messages, bot_user_id=self.bot.user.id)
+                if not transcript:
+                    continue
+                ticket_id = str(channel.id)
+                ticket_data.append({
+                    "id": ticket_id,
+                    "channel_name": channel.name,
+                    "channel_topic": channel.topic or "",
+                    "category_id": str(channel.category_id or ""),
+                    "category_name": getattr(channel.category, "name", ""),
+                    "recipient_id": str(getattr(getattr(thread, "recipient", None), "id", "")),
+                    "known_resolved": latest_conversation_has_closing(
+                        log_messages, AI_ALL_CLOSING
+                    ),
+                    "latest_human_message_is_staff": last_relayed_message_is_human_staff(
+                        log_messages, bot_user_id=self.bot.user.id
+                    ),
+                    "transcript": transcript,
+                })
+                contexts[ticket_id] = (thread, channel)
+
+            decisions = await reviewer.review(ticket_data)
+            if decisions is None:
+                await self._log_ai_sort(
+                    "Gemini batch review failed", reviewer.last_detail,
+                    fields=[("Trigger", trigger), ("Model", reviewer.model), ("API requests", "1")],
+                    error=True,
+                )
+                return 0, len(threads)
+
+            succeeded = 0
+            for ticket_id, decision in decisions.items():
+                thread, channel = contexts[ticket_id]
+                actions = []
+                if ticket_is_rename_eligible(channel.name):
+                    try:
+                        await channel.edit(
+                            name=decision["ticket_name"],
+                            reason=f"Gemini ticket review ({trigger})",
+                        )
+                        actions.append(f"Renamed to `{decision['ticket_name']}`")
+                    except Exception as exc:
+                        actions.append(f"Rename failed: {type(exc).__name__}")
+                else:
+                    actions.append("Existing ticket name preserved")
+                suggested_reply = (
+                    decision["suggested_reply"]
+                    if decision["status"] == "awaiting_staff"
+                    else "None — the ticket is not awaiting a staff reply"
+                )
+                await self._log_ai_sort(
+                    "Gemini ticket review", channel.mention,
+                    fields=[
+                        ("Status", decision["status"]),
+                        ("Active inquiry summary", decision["summary"] or "No unresolved inquiry"),
+                        ("Suggested reply", suggested_reply or "No safe suggestion generated"),
+                        ("Actions", "\n".join(actions)),
+                        ("Ticket notification", "None — review logs only; nobody was pinged"),
+                    ],
+                )
+                succeeded += 1
+            await self._log_ai_sort(
+                "Gemini batch review complete",
+                f"Processed {len(threads)} ticket(s); {succeeded} completed successfully.",
+                fields=[("Trigger", trigger), ("Model", reviewer.model), ("API requests", "1")],
+                error=False,
+            )
+            return succeeded, len(threads)
+
+    @tasks.loop(time=AI_SORT_TIMES)
+    async def scheduled_ai_sort(self):
+        """Review tickets at 06:00 and 18:25 Europe/London time."""
+        if not self.bot.config.get("ai_sort_enabled"):
+            return
+        try:
+            await self._run_ai_sort(trigger="scheduled 06:00/18:25 Europe/London")
+        except Exception:
+            logger.error("Scheduled Gemini ticket review failed.", exc_info=True)
+
+    @scheduled_ai_sort.before_loop
+    async def before_scheduled_ai_sort(self):
+        await self.bot.wait_until_ready()
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    async def aisort(self, ctx):
+        """Run one Gemini batch review over every open ticket."""
+        status = await ctx.send("Running one Gemini request for all open tickets…")
+        succeeded, total = await self._run_ai_sort(
+            trigger=f"manual aisort by {ctx.author} ({ctx.author.id})"
+        )
+        await status.edit(content=f"Gemini review complete: {succeeded}/{total} ticket(s) reviewed.")
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def aisort1(self, ctx):
+        """Run one Gemini review request for the current ticket."""
+        succeeded, _ = await self._run_ai_sort(
+            trigger=f"manual aisort1 by {ctx.author} ({ctx.author.id})",
+            only_thread=ctx.thread,
+        )
+        if succeeded:
+            await ctx.send("This ticket has been reviewed by Gemini.")
+        else:
+            await ctx.send("Gemini could not review this ticket. Check the AI review log channel.")
 
     async def auto_unsnooze_task(self):
         await self.bot.wait_until_ready()
@@ -480,6 +1027,415 @@ class Modmail(commands.Cog):
             embed = create_not_found_embed(name, self.bot.snippets.keys(), "Snippet")
         await ctx.send(embed=embed)
 
+    @commands.group(aliases=["autoreplies"], invoke_without_command=True)
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    async def autoreply(self, ctx, *, name: str.lower = None):
+        """
+        Manage the set messages Gemini may select for a new ticket.
+
+        Create an alias-backed rule with:
+        - `{prefix}autoreply create "NAME: How can I apply"`
+          `["MUST MENTION TO CHECK": apply, application, become, staff] apply`
+        - Add choices with `["ALTERNATIVES": {{"Application status": status-alias}},`
+          `{{"Application requirements": requirements-alias}}]`.
+        - Add trusted selection guidance at the very end with
+          `["ADDITIONAL INFO": "Context Gemini must consider before choosing"]`.
+
+        The primary alias and every alternative must already exist. Once the trigger
+        matches, Gemini selects the best reply and executes that alias in full.
+        """
+        autoreplies = self.bot.config["autoreplies"]
+        raw_requested = False
+        if name is not None:
+            raw_match = re.fullmatch(r"(.+?)\s+raw\s*", name, re.IGNORECASE | re.DOTALL)
+            if raw_match is not None:
+                name = raw_match.group(1).strip()
+                raw_requested = True
+        if name is not None:
+            key = self._find_autoreply_key(autoreplies, name)
+            if key is None:
+                embed = create_not_found_embed(name, autoreplies.keys(), "Autoreply")
+            elif raw_requested:
+                raw_command = (
+                    f"{self.bot.prefix}autoreply edit "
+                    f"{format_autoreply_rule_spec(key, autoreplies[key])}"
+                )
+                if len(raw_command) > 3_900:
+                    return await ctx.send(
+                        "The raw autoreply was too long for a code box, so it is attached below.",
+                        file=discord.File(
+                            BytesIO(raw_command.encode("utf-8")),
+                            filename=f"autoreply-{key}.txt",
+                        ),
+                    )
+                embed = discord.Embed(
+                    title=f'Raw autoreply - "{key}"',
+                    description=f"```\n{escape_code_block(raw_command)}\n```",
+                    color=self.bot.main_color,
+                )
+            else:
+                entry = autoreplies[key]
+                embed = discord.Embed(
+                    title=f'Autoreply - "{key}"',
+                    description=self._format_autoreply_entry(key, entry),
+                    color=self.bot.main_color,
+                )
+            return await ctx.send(embed=embed)
+
+        if not autoreplies:
+            return await ctx.send(
+                embed=discord.Embed(
+                    color=self.bot.error_color,
+                    description=(
+                        "No AI autoreplies are configured. Create one with "
+                        f"`{self.bot.prefix}autoreply create \"NAME: ...\" "
+                        "[\"MUST MENTION TO CHECK\": word, phrase] alias-name`."
+                    ),
+                )
+            )
+
+        embeds = [
+            discord.Embed(title="AI autoreplies", color=self.bot.main_color)
+            for _ in range((len(autoreplies) - 1) // 10 + 1)
+        ]
+        for index, (reply_name, value) in enumerate(sorted(autoreplies.items())):
+            embeds[index // 10].add_field(
+                name=reply_name,
+                value=return_or_truncate(self._format_autoreply_entry(reply_name, value), 350),
+                inline=False,
+            )
+        return await EmbedPaginatorSession(ctx, *embeds).run()
+
+    @staticmethod
+    def _format_autoreply_entry(key, entry):
+        if not isinstance(entry, dict):
+            return str(entry)
+        triggers = ", ".join(f"`{term}`" for term in (entry.get("triggers") or []))
+        formatted = (
+            f"**Name:** {entry.get('name') or key}\n"
+            f"**Must mention:** {triggers or '[none]'}\n"
+            f"**Alias:** `{entry.get('alias') or '[missing]'}`"
+        )
+        alternatives = entry.get("alternatives") or []
+        if alternatives:
+            formatted += "\n**Alternatives:**\n" + "\n".join(
+                f"- {alternative.get('name') or '[unnamed]'}: "
+                f"`{alternative.get('alias') or '[missing]'}`"
+                for alternative in alternatives
+                if isinstance(alternative, dict)
+            )
+        additional_info = str(entry.get("additional_info") or "").strip()
+        if additional_info:
+            formatted += f"\n**Additional info:** {additional_info}"
+        return formatted
+
+    @staticmethod
+    def _autoreply_variants(key, entry):
+        """Return the primary and named alternative alias choices for a rule."""
+        if not isinstance(entry, dict):
+            return [(str(key), None)]
+        variants = [(str(entry.get("name") or key).strip(), str(entry.get("alias") or "").strip())]
+        variants.extend(
+            (
+                str(alternative.get("name") or "").strip(),
+                str(alternative.get("alias") or "").casefold().strip(),
+            )
+            for alternative in (entry.get("alternatives") or [])
+            if isinstance(alternative, dict)
+        )
+        return variants
+
+    @classmethod
+    def _autoreply_choice_count(cls, key, entry):
+        return len(cls._autoreply_variants(key, entry))
+
+    @staticmethod
+    def _find_autoreply_key(autoreplies, name):
+        normalized = str(name).casefold().strip()
+        if normalized in autoreplies:
+            return normalized
+        for key, entry in autoreplies.items():
+            if isinstance(entry, dict) and str(entry.get("name", "")).casefold() == normalized:
+                return key
+            if isinstance(entry, dict) and any(
+                isinstance(alternative, dict)
+                and str(alternative.get("name", "")).casefold() == normalized
+                for alternative in (entry.get("alternatives") or [])
+            ):
+                return key
+        return None
+
+    @autoreply.command(name="set", aliases=["add", "edit", "create"])
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    async def autoreply_set(self, ctx, name: str, *, value: commands.clean_content):
+        """Create or update an AI-selectable set message."""
+        autoreplies = self.bot.config["autoreplies"]
+        replacement_keys = set()
+        if re.match(r"\s*name\s*:", name, re.IGNORECASE):
+            try:
+                entry = parse_autoreply_rule_spec(name, value)
+            except ValueError as exc:
+                raise commands.BadArgument(str(exc)) from exc
+
+            alias_name = entry["alias"]
+            variants = self._autoreply_variants(alias_name, entry)
+            for display_name, variant_alias in variants:
+                if display_name.upper() == NO_MATCH or variant_alias.upper() == NO_MATCH:
+                    raise commands.BadArgument("That autoreply name is reserved.")
+                raw_alias = self.bot.aliases.get(variant_alias)
+                if raw_alias is None:
+                    raise commands.BadArgument(
+                        f"Alias `{variant_alias}` does not exist. Create it before this autoreply rule."
+                    )
+                reply_steps = parse_reply_alias(raw_alias)
+                if reply_steps is None:
+                    raise commands.BadArgument(
+                        f"Alias `{variant_alias}` must include a reply-style step with message text."
+                    )
+                if len("\n\n".join(message for _, message in reply_steps)) > 4_000:
+                    raise commands.BadArgument(
+                        f"Alias `{variant_alias}` has more than 4,000 characters of reply text."
+                    )
+
+            new_display_names = {name.casefold() for name, _ in variants}
+            for existing_key, existing_entry in autoreplies.items():
+                if existing_key == alias_name:
+                    continue
+                existing_variants = self._autoreply_variants(existing_key, existing_entry)
+                existing_by_name = {
+                    display_name.casefold(): variant_alias.casefold()
+                    for display_name, variant_alias in existing_variants
+                }
+                conflicts = new_display_names & set(existing_by_name)
+                if not conflicts:
+                    continue
+                new_by_name = {
+                    display_name.casefold(): variant_alias.casefold()
+                    for display_name, variant_alias in variants
+                }
+                # Editing may merge formerly standalone rules into one alternatives group when
+                # each duplicate display name still points to the same alias. Creating a rule, or
+                # changing what an existing display name executes, remains a hard conflict.
+                if (
+                    str(ctx.invoked_with).casefold() == "edit"
+                    and len(conflicts) == len(existing_variants)
+                    and all(existing_by_name[name] == new_by_name[name] for name in conflicts)
+                ):
+                    replacement_keys.add(existing_key)
+                else:
+                    raise commands.BadArgument(
+                        "Another primary or alternative autoreply already uses that display name."
+                    )
+
+            key = alias_name
+            alternative_count = len(variants) - 1
+            response_description = (
+                f'`{entry["name"]}` and {alternative_count} alternative(s) will be compared when '
+                "a recipient message contains one of the must-mention terms; Gemini will execute "
+                "only the best matching alias."
+            )
+        else:
+            key = name.casefold().strip()
+            entry = str(value)
+            if key.upper() == NO_MATCH:
+                raise commands.BadArgument("That autoreply name is reserved.")
+            if not key or len(key) > AUTOREPLY_DISPLAY_NAME_LIMIT:
+                raise commands.BadArgument(
+                    "Autoreply names cannot be longer than "
+                    f"{AUTOREPLY_DISPLAY_NAME_LIMIT} characters."
+                )
+            if len(entry) > 4_000:
+                raise commands.BadArgument(
+                    "Autoreply messages cannot be longer than 4,000 characters."
+                )
+            response_description = f"`{key}` is ready for Gemini to select on new tickets."
+
+        existing_choice_count = sum(
+            self._autoreply_choice_count(existing_key, existing_entry)
+            for existing_key, existing_entry in autoreplies.items()
+            if existing_key != key and existing_key not in replacement_keys
+        )
+        new_choice_count = self._autoreply_choice_count(key, entry)
+        if existing_choice_count + new_choice_count > AUTOREPLY_TOTAL_CHOICE_LIMIT:
+            raise commands.BadArgument(
+                "You can configure up to "
+                f"{AUTOREPLY_TOTAL_CHOICE_LIMIT} total primary and alternative "
+                "AI autoreply choices."
+            )
+
+        existed = key in autoreplies
+        for replacement_key in replacement_keys:
+            autoreplies.pop(replacement_key, None)
+        autoreplies[key] = entry
+        await self.bot.config.update()
+        action = "Updated" if existed else "Created"
+        await ctx.send(
+            embed=discord.Embed(
+                title=f"{action} AI autoreply",
+                description=response_description,
+                color=self.bot.main_color,
+            )
+        )
+
+    @autoreply.command(name="remove", aliases=["delete", "del"])
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    async def autoreply_remove(self, ctx, *, name: str.lower):
+        """Delete an AI autoreply."""
+        autoreplies = self.bot.config["autoreplies"]
+        key = self._find_autoreply_key(autoreplies, name)
+        if key is None:
+            return await ctx.send(
+                embed=create_not_found_embed(name, autoreplies.keys(), "Autoreply")
+            )
+
+        autoreplies.pop(key)
+        await self.bot.config.update()
+        await ctx.send(
+            embed=discord.Embed(
+                title="Removed AI autoreply",
+                description=f"`{key}` will no longer be selected.",
+                color=self.bot.main_color,
+            )
+        )
+
+    def _custom_abuse_terms(self):
+        raw_terms = self.bot.config.get("abuse_filter_extra_terms") or []
+        if isinstance(raw_terms, str):
+            raw_terms = [raw_terms]
+        return sorted(
+            dict.fromkeys(
+                normalized
+                for normalized in (
+                    normalize_custom_abuse_term(term) for term in raw_terms
+                )
+                if normalized
+            )
+        )
+
+    @commands.group(aliases=["abusewords"], invoke_without_command=True)
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def abuseword(self, ctx):
+        """Manage additional words and phrases that automatically close tickets."""
+        prefix = self.bot.prefix
+        terms = self._custom_abuse_terms()
+        await ctx.send(
+            embed=discord.Embed(
+                title="Automatic abuse-word filter",
+                description=(
+                    "The built-in severe-abuse list is always active. Additional entries persist "
+                    "until removed. Enter their normal spelling; common evasions are detected "
+                    "automatically.\n\n"
+                    f"`{prefix}abuseword add WORD OR PHRASE`\n"
+                    f"`{prefix}abuseword remove WORD OR PHRASE`\n"
+                    f"`{prefix}abuseword list`\n\n"
+                    f"**Custom entries:** {len(terms)}/100"
+                ),
+                color=self.bot.main_color,
+            )
+        )
+
+    @abuseword.command(name="add")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def abuseword_add(self, ctx, *, term: str):
+        """Add a persistent word or phrase to the automatic abuse filter."""
+        normalized = normalize_custom_abuse_term(term)
+        if len(normalized.replace(" ", "")) < 2:
+            raise commands.BadArgument("Enter at least two letters or numbers.")
+        if len(normalized) > 100:
+            raise commands.BadArgument("Abuse-filter entries cannot exceed 100 characters.")
+        if contains_abusive_language(normalized):
+            return await ctx.send(
+                embed=discord.Embed(
+                    title="Already covered",
+                    description=f"`{normalized}` is already covered by the built-in filter.",
+                    color=self.bot.error_color,
+                )
+            )
+
+        terms = self._custom_abuse_terms()
+        if normalized in terms:
+            return await ctx.send(
+                embed=discord.Embed(
+                    title="Already added",
+                    description=f"`{normalized}` is already in the custom abuse-word list.",
+                    color=self.bot.error_color,
+                )
+            )
+        if len(terms) >= 100:
+            raise commands.BadArgument("The custom abuse-word list is limited to 100 entries.")
+
+        terms.append(normalized)
+        self.bot.config["abuse_filter_extra_terms"] = sorted(terms)
+        await self.bot.config.update()
+        await ctx.send(
+            embed=discord.Embed(
+                title="Added abuse-filter entry",
+                description=(
+                    f"`{normalized}` will now automatically trigger the warning and close "
+                    "the ticket."
+                ),
+                color=self.bot.main_color,
+            )
+        )
+
+    @abuseword.command(name="remove", aliases=["delete", "del"])
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def abuseword_remove(self, ctx, *, term: str):
+        """Remove a word or phrase from the custom automatic abuse filter."""
+        normalized = normalize_custom_abuse_term(term)
+        terms = self._custom_abuse_terms()
+        if normalized not in terms:
+            return await ctx.send(
+                embed=create_not_found_embed(
+                    normalized or term,
+                    terms,
+                    "Custom abuse-filter entry",
+                )
+            )
+
+        terms.remove(normalized)
+        self.bot.config["abuse_filter_extra_terms"] = terms
+        await self.bot.config.update()
+        await ctx.send(
+            embed=discord.Embed(
+                title="Removed abuse-filter entry",
+                description=f"`{normalized}` is no longer in the custom abuse-word list.",
+                color=self.bot.main_color,
+            )
+        )
+
+    @abuseword.command(name="list")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def abuseword_list(self, ctx):
+        """List all administrator-added abuse words and phrases."""
+        terms = self._custom_abuse_terms()
+        if not terms:
+            return await ctx.send(
+                embed=discord.Embed(
+                    title="Custom abuse-filter entries",
+                    description=(
+                        "No custom entries are configured. The built-in list is still active."
+                    ),
+                    color=self.bot.main_color,
+                )
+            )
+
+        embeds = []
+        for offset in range(0, len(terms), 25):
+            chunk = terms[offset : offset + 25]
+            description = "\n".join(
+                f"{index}. `{term}`"
+                for index, term in enumerate(chunk, start=offset + 1)
+            )
+            embeds.append(
+                discord.Embed(
+                    title=f"Custom abuse-filter entries ({len(terms)}/100)",
+                    description=description,
+                    color=self.bot.main_color,
+                )
+            )
+        return await EmbedPaginatorSession(ctx, *embeds).run()
+
     @commands.command(usage="<category> [options]")
     @checks.has_permissions(PermissionLevel.MODERATOR)
     @checks.thread_only()
@@ -638,6 +1594,118 @@ class Modmail(commands.Cog):
             mention = "@" + user_or_role.lstrip("@")
         return mention
 
+    async def _get_smart_ai_context(self) -> str:
+        """Return persistent smart-AI context, falling back to the bundled knowledge base."""
+        configured = str(self.bot.config.get("smart_ai_context", convert=False) or "").strip()
+        if configured:
+            return configured
+        return (
+            await asyncio.to_thread(
+                DEFAULT_SMART_AI_CONTEXT_PATH.read_text,
+                encoding="utf-8",
+            )
+        ).strip()
+
+    @commands.group(invoke_without_command=True, usage="<MESSAGE>")
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def context(self, ctx, *, message: str = ""):
+        """Post plain staff-only context in a ticket, including from an alias."""
+        if getattr(ctx, "thread", None) is None:
+            raise commands.CommandError("This form of the context command must be used in a thread.")
+        message = message.strip()
+        if not message:
+            raise commands.BadArgument("Provide the staff context message.")
+        if len(message) > 2_000:
+            raise commands.BadArgument("Staff context messages cannot exceed 2,000 characters.")
+
+        staff_message = await ctx.send(
+            message,
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+        try:
+            await self.bot.api.append_log(staff_message, type_="internal")
+        except Exception:
+            logger.warning("Failed to append an alias context message to the ticket log.", exc_info=True)
+        return staff_message
+
+    @commands.command()
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @checks.thread_only()
+    async def aifeed(self, ctx, *, information: commands.clean_content):
+        """Add trusted ticket-specific context for automatic AI checks without replying."""
+        information = str(information or "").strip()
+        if not information:
+            raise commands.BadArgument("Provide the information the AI should use.")
+        if len(information) > 2_000:
+            raise commands.BadArgument("AI feed information cannot exceed 2,000 characters.")
+
+        # Store only the supplied information, not the command prefix/invocation. This is an
+        # internal log entry: it dispatches no thread reply event, sends nothing to the recipient,
+        # and therefore does not cancel, restart, or debounce an onboarding assessment.
+        feed_entry = SimpleNamespace(
+            id=ctx.message.id,
+            channel=ctx.channel,
+            created_at=ctx.message.created_at,
+            author=ctx.author,
+            content=information,
+            attachments=[],
+        )
+        try:
+            await self.bot.api.append_log(feed_entry, type_="ai_feed")
+        except Exception as exc:
+            logger.warning("Failed to persist ticket AI feed information.", exc_info=True)
+            raise commands.CommandError(
+                "The AI feed could not be saved, so the AI will not use it."
+            ) from exc
+
+        embed = discord.Embed(
+            title="AI feed added",
+            description=information,
+            color=self.bot.main_color,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text=f"Added by {ctx.author}")
+        await ctx.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+
+    @context.command(name="raw")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def context_raw(self, ctx):
+        """Download the currently active smart-AI knowledge base."""
+        content = await self._get_smart_ai_context()
+        await ctx.send(
+            file=discord.File(
+                BytesIO(content.encode("utf-8")),
+                filename="TUI_Airways_Roblox_Smart_AI_Context.md",
+            )
+        )
+
+    @context.command(name="edit")
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def context_edit(self, ctx):
+        """Replace the persistent smart-AI context with an attached text/Markdown file."""
+        attachment = next(
+            (
+                item
+                for item in ctx.message.attachments
+                if item.filename.casefold().endswith(AI_TEXT_ATTACHMENT_EXTENSIONS)
+            ),
+            None,
+        )
+        if attachment is None:
+            raise commands.BadArgument("Attach one .txt, .md, or .markdown context file.")
+        if attachment.size > AI_TEXT_ATTACHMENT_MAX_BYTES:
+            raise commands.BadArgument(
+                f"Context files cannot exceed {AI_TEXT_ATTACHMENT_MAX_BYTES:,} bytes."
+            )
+        try:
+            content = decode_ai_text_attachment(attachment.filename, await attachment.read()).strip()
+        except ValueError as exc:
+            raise commands.BadArgument(str(exc)) from exc
+        if not content:
+            raise commands.BadArgument("The attached context file is empty.")
+        await self.bot.config.set("smart_ai_context", content, convert=False)
+        await ctx.send("Smart AI context updated successfully.")
+
     @commands.command(aliases=["alert"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
@@ -651,6 +1719,24 @@ class Modmail(commands.Cog):
         `@here` and `@everyone` can be substituted with `here` and `everyone`.
         `user_or_role` may be a user ID, mention, name. role ID, mention, name, "everyone", or "here".
         """
+        # In an automatic AI alias, ``"notify @role"`` means notify the role
+        # immediately in the staff ticket. Direct staff use of ``?notify``
+        # retains its original "notify on the next message" behavior.
+        if getattr(ctx, "_ai_autoreply", False):
+            if not isinstance(user_or_role, discord.Role):
+                raise commands.BadArgument(
+                    'The automatic alias step must use "notify @role" with a valid role.'
+                )
+            return await ctx.send(
+                user_or_role.mention,
+                allowed_mentions=discord.AllowedMentions(
+                    everyone=False,
+                    users=False,
+                    roles=[user_or_role],
+                    replied_user=False,
+                ),
+            )
+
         mention = self.parse_user_or_role(ctx, user_or_role)
         if mention is None:
             raise commands.BadArgument(f"{user_or_role} is not a valid user or role.")
@@ -725,6 +1811,27 @@ class Modmail(commands.Cog):
         `@here` and `@everyone` can be substituted with `here` and `everyone`.
         `user_or_role` may be a user ID, mention, name, role ID, mention, name, "everyone", or "here".
         """
+        embed = await self._subscribe_target(ctx, user_or_role)
+        result = await ctx.send(embed=embed)
+
+        # An autoreply alias uses ``sub`` as its routing action. Subscription alone only affects
+        # future recipient messages, so alert the selected team immediately as part of this run.
+        if getattr(ctx, "_ai_autoreply", False):
+            mention = self.parse_user_or_role(ctx, user_or_role)
+            if mention is not None:
+                await ctx.send(
+                    mention,
+                    allowed_mentions=discord.AllowedMentions(
+                        everyone=mention in {"@here", "@everyone"},
+                        users=isinstance(user_or_role, (discord.Member, discord.User)),
+                        roles=isinstance(user_or_role, discord.Role),
+                        replied_user=False,
+                    ),
+                )
+        return result
+
+    async def _subscribe_target(self, ctx, user_or_role):
+        """Subscribe a target and return the normal staff-side result embed."""
         mention = self.parse_user_or_role(ctx, user_or_role)
         if mention is None:
             raise commands.BadArgument(f"{user_or_role} is not a valid user or role.")
@@ -748,7 +1855,33 @@ class Modmail(commands.Cog):
                 color=self.bot.main_color,
                 description=f"{mention} will now be notified of all messages received.",
             )
-        return await ctx.send(embed=embed)
+        return embed
+
+    @commands.command()
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @checks.thread_only()
+    async def transfer(self, ctx, *, user: User = None):
+        """Transfer a ticket to a user and subscribe them to future replies."""
+        if user is None:
+            return await ctx.send(
+                f"Please use {self.bot.prefix}transfer @USER",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+
+        user_mention = getattr(user, "mention", f"<@{user.id}>")
+        transfer_message = (
+            "**<:Connected:1384981326246969344> | Ticket Transferred**\n\n"
+            f"This ticket has now been transferred to {user_mention} to best handle your inquiry."
+        )
+
+        # Match the requested ``freply ... && sub USER`` order: send the
+        # recipient-facing transfer notice first, then subscribe the assignee.
+        ctx.message.content = transfer_message
+        async with safe_typing(ctx):
+            await ctx.thread.reply(ctx.message, transfer_message)
+
+        subscription_embed = await self._subscribe_target(ctx, user)
+        await ctx.send(embed=subscription_embed)
 
     @commands.command(aliases=["unsub"])
     @checks.has_permissions(PermissionLevel.SUPPORTER)
@@ -1445,6 +2578,37 @@ class Modmail(commands.Cog):
         await session.run()
 
     @commands.command()
+    @checks.has_permissions(PermissionLevel.ADMINISTRATOR)
+    async def v2(self, ctx, state: str = None):
+        """Enable or disable the redesigned ticket-message embeds."""
+        normalized = str(state or "").strip().casefold()
+        if normalized not in {"on", "off"}:
+            current = "on" if self.bot.config.get("message_embeds_v2") else "off"
+            raise commands.BadArgument(
+                f"Use `{self.bot.prefix}v2 on` or `{self.bot.prefix}v2 off`. "
+                f"V2 embeds are currently **{current}**."
+            )
+
+        enabled = normalized == "on"
+        self.bot.config["message_embeds_v2"] = enabled
+        await self.bot.config.update()
+
+        embed = discord.Embed(
+            title=f"Ticket message V2 is now {'enabled' if enabled else 'disabled'}",
+            description=(
+                "New staff, AI, alias, snippet, and recipient messages will use the V2 "
+                "embed design. Existing messages are unchanged."
+                if enabled
+                else "New ticket messages have returned to the existing embed design. "
+                "Existing messages are unchanged."
+            ),
+            color=0x70CBF4 if enabled else self.bot.main_color,
+            timestamp=discord.utils.utcnow(),
+        )
+        embed.set_footer(text=f"Changed by {ctx.author}")
+        await ctx.send(embed=embed)
+
+    @commands.command()
     @checks.has_permissions(PermissionLevel.SUPPORTER)
     @checks.thread_only()
     async def reply(self, ctx, *, msg: str = ""):
@@ -1455,7 +2619,716 @@ class Modmail(commands.Cog):
         automatically embedding image URLs.
         """
 
-        # Ensure logs record only the reply text, not the command.
+        if ctx.author.id == AUTOFILL_STAFF_USER_ID:
+            recipient = ctx.thread.recipient
+            recipient_name = (
+                getattr(recipient, "display_name", None)
+                or getattr(recipient, "name", None)
+                or str(recipient)
+            )
+            msg = expand_staff_reply_markers(msg, recipient_name)
+
+        # Ensure logs record only the expanded reply text, not the command.
+        ctx.message.content = msg
+        async with safe_typing(ctx):
+            await ctx.thread.reply(ctx.message, msg)
+
+    @commands.command()
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    async def applicationreading(self, ctx):
+        """Preview the live Careers reading schedule in this channel (does not DM the user)."""
+        from core.application_reading import application_reading_reply
+
+        await ctx.send(
+            await application_reading_reply(self.bot),
+            allowed_mentions=discord.AllowedMentions.none(),
+        )
+
+    @commands.command()
+    @checks.has_permissions(PermissionLevel.SUPPORTER)
+    @checks.thread_only()
+    async def applicationstatus(self, ctx):
+        """Reply with the ticket recipient's application status; accepts no username."""
+        from core.application_status import STATUS_MARKER
+
+        await ctx.thread.reply(ctx.message, STATUS_MARKER)
+
+    @commands.command(name="sr", usage="<USER> <MESSAGE>")
+    @checks.has_user_id(1458951643377963178, 811638993695408180)
+    @checks.thread_only()
+    async def spoofreply(
+        self,
+        ctx,
+        user: Union[discord.Member, discord.User],
+        *,
+        message: str,
+    ):
+        """Send and log a thread reply under another user's visible identity."""
+        synthetic = DummyMessage(copy.copy(ctx.message))
+        synthetic.author = user
+        synthetic._reply_authorizer = ctx.author
+        synthetic.content = message
+        async with safe_typing(ctx):
+            await ctx.thread.reply(synthetic, message)
+
+    @commands.command(usage="<MESSAGE>")
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def fakeautoreply(self, ctx, *, message: str):
+        """Send staff-provided text using the AI autoreply presentation."""
+        await ctx.thread.ensure_staff_reply_subscription(ctx.author, ctx.message)
+        if len(message) > 4_000:
+            raise commands.BadArgument("Fake AI autoreplies cannot exceed 4,000 characters.")
+
+        delivery_error = None
+        async with safe_typing(ctx):
+            try:
+                await ctx.thread._send_ai_autoreply("Manual fake autoreply", message)
+            except Exception as exc:
+                delivery_error = exc
+
+        await ctx.thread._log_ai_check(
+            ctx.message,
+            message,
+            outcome="delivery_error" if delivery_error is not None else "manual_fake",
+            detail=(
+                f"Manual fake autoreply delivery failed ({type(delivery_error).__name__})."
+                if delivery_error is not None
+                else "A staff member sent a manual fake AI autoreply."
+            ),
+            selected_name="fakeautoreply",
+            response_text=message,
+            delivery_status=(
+                "Manual fake AI autoreply delivery failed."
+                if delivery_error is not None
+                else "Manual fake AI autoreply delivered."
+            ),
+        )
+        if delivery_error is not None:
+            raise delivery_error
+
+        # Treat the manually sent message as a staff response for reminder bookkeeping.
+        self.bot.dispatch("thread_reply", ctx.thread, True, ctx.message, False, False)
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def aihi(self, ctx):
+        """Send one of four pre-written AI-assistance introductions without calling Gemini."""
+        await ctx.thread.ensure_staff_reply_subscription(ctx.author, ctx.message)
+        message = secrets.choice(AI_HELLO_MESSAGES)
+        async with safe_typing(ctx):
+            await ctx.thread._send_ai_autoreply(
+                "AI assistance introduction",
+                message,
+                author_name="AI assistant",
+                footer_text=AI_HELLO_FOOTER,
+            )
+
+        await ctx.thread._log_ai_check(
+            ctx.message,
+            "Random selection from four pre-written introductions.",
+            outcome="premade",
+            detail="Sent a pre-written AI-assistance introduction; Gemini was not called.",
+            selected_name="aihi",
+            response_text=message,
+            delivery_status="Pre-written AI-assistance introduction delivered.",
+        )
+        self.bot.dispatch("thread_reply", ctx.thread, True, ctx.message, False, False)
+
+    @commands.command(aliases=["aibye"])
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def aiclose(self, ctx):
+        """Send the standard closure reply from the AI identity, then close the ticket."""
+        await ctx.thread.ensure_staff_reply_subscription(ctx.author, ctx.message)
+        async with safe_typing(ctx):
+            await ctx.thread._send_ai_autoreply(
+                "Manual AI ticket closure",
+                AI_CLOSE_MESSAGE,
+            )
+
+        await ctx.thread._log_ai_check(
+            ctx.message,
+            "Staff invoked the standard AI ticket closure.",
+            outcome="premade",
+            detail="Sent the pre-written AI ticket closure; Gemini was not called.",
+            selected_name="aiclose",
+            response_text=AI_CLOSE_MESSAGE,
+            delivery_status="AI ticket-closure message delivered.",
+        )
+        self.bot.dispatch("thread_reply", ctx.thread, True, ctx.message, False, False)
+        await ctx.thread.close(closer=ctx.author)
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def aitest(self, ctx, mode: str = None):
+        """Continuously answer recipient turns until the ticket requires a human or subscriber."""
+        normalized_mode = str(mode or "").strip().casefold()
+        if normalized_mode not in {"", "stop"}:
+            raise commands.BadArgument(
+                f"Use `{self.bot.prefix}aitest` or `{self.bot.prefix}aitest stop`."
+            )
+
+        if normalized_mode != "stop":
+            await ctx.thread.ensure_staff_reply_subscription(ctx.author, ctx.message)
+
+        key = str(ctx.thread.id)
+        if normalized_mode == "stop":
+            was_active = key in self._ai_test_threads
+            self._ai_test_threads.discard(key)
+            return await ctx.send(
+                "Continuous AI test mode stopped."
+                if was_active
+                else "Continuous AI test mode was not active in this ticket."
+            )
+
+        if key in self._ai_test_threads:
+            return await ctx.send(
+                f"Continuous AI test mode is already active. Use `{self.bot.prefix}aitest stop` "
+                "to disable it."
+            )
+
+        self._ai_test_threads.add(key)
+        await ctx.send(
+            "Continuous AI test mode enabled. It will stop when human assistance is required "
+            "or an autoreply alias subscribes a user or role."
+        )
+
+        if getattr(ctx.thread, "_opening_intake_pending", False):
+            await ctx.send(
+                "The opening AI workflow is still running; continuous mode will wait until its "
+                "hello, autoreply, and resolution check have completed."
+            )
+            return
+
+        # Immediately process the latest recipient turn so staff do not have to wait for another
+        # message after enabling the mode.
+        try:
+            log_entry = await self.bot.api.get_log(ctx.channel.id)
+            latest_recipient = next(
+                (
+                    item
+                    for item in reversed((log_entry or {}).get("messages") or [])
+                    if (item.get("author") or {}).get("mod") is False
+                    and str(item.get("content") or "").strip()
+                ),
+                None,
+            )
+            if latest_recipient is not None:
+                synthetic = DummyMessage(copy.copy(ctx.message))
+                synthetic.author = ctx.thread.recipient
+                synthetic.content = str(latest_recipient.get("content") or "").strip()
+                synthetic.attachments = []
+                synthetic.id = int(latest_recipient.get("message_id") or ctx.message.id)
+                await self._run_ai_test_cycle(ctx.thread, synthetic)
+        except Exception:
+            self._ai_test_threads.discard(key)
+            logger.error("Could not start continuous AI test mode.", exc_info=True)
+            raise commands.CommandError(
+                "Continuous AI test mode could not review the current ticket and was stopped."
+            )
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def airude(self, ctx):
+        """Send the approved abuse warning, then silently close the ticket."""
+        # Reuse the deterministic autoswearing text so manual and automatic enforcement always
+        # communicate exactly the same rule. Close silently because the warning already tells the
+        # recipient that the ticket has been closed.
+        ctx.message.content = ABUSE_AUTO_CLOSE_MESSAGE
+        async with safe_typing(ctx):
+            await ctx.thread.reply(ctx.message, ABUSE_AUTO_CLOSE_MESSAGE)
+        await ctx.thread.close(closer=ctx.author, silent=True)
+
+    async def _send_generated_ai_reply(
+        self,
+        ctx,
+        generator_cls,
+        *,
+        command_name: str,
+        log_name: str,
+        tone_label: str,
+        staff_only: bool = False,
+        include_closing: bool = True,
+        closing_text: str = AI_REPLY_CLOSING,
+        relay_context_only: bool = False,
+        staff_context: str = "",
+        staff_attachment_context: str = "",
+    ):
+        """Generate, deliver, and audit a manual AI reply from permitted ticket context."""
+        if not staff_only:
+            await ctx.thread.ensure_staff_reply_subscription(ctx.author, ctx.message)
+        api_key = self.bot.config.get("gemini_api_key", convert=False)
+        if not api_key or self.bot.session is None:
+            raise commands.CommandError("Gemini API credentials are not configured.")
+
+        staff_context = str(staff_context or "").strip()
+        if relay_context_only:
+            log_entry = await self.bot.api.get_log(ctx.channel.id)
+            if log_entry is None:
+                raise commands.CommandError("The ticket conversation log could not be loaded.")
+            transcript, message_count = build_relayed_reply_transcript(
+                log_entry.get("messages") or [],
+                bot_user_id=self.bot.user.id,
+            )
+        else:
+            transcript_blocks = []
+            message_count = 0
+            async for message in ctx.channel.history(limit=None, oldest_first=True):
+                if message.id == ctx.message.id:
+                    continue
+
+                parts = []
+                content = (getattr(message, "clean_content", None) or message.content or "").strip()
+                if content:
+                    parts.append(content)
+                for embed in message.embeds:
+                    embed_parts = []
+                    if embed.title:
+                        embed_parts.append(f"Title: {embed.title}")
+                    if embed.description:
+                        embed_parts.append(str(embed.description))
+                    for field in embed.fields:
+                        embed_parts.append(f"{field.name}: {field.value}")
+                    if embed.footer and embed.footer.text:
+                        embed_parts.append(f"Footer: {embed.footer.text}")
+                    if embed_parts:
+                        embed_author = getattr(embed.author, "name", None) or "embedded message"
+                        parts.append(f"{embed_author}: " + "\n".join(embed_parts))
+                if message.attachments:
+                    parts.append(
+                        "Attachments: "
+                        + ", ".join(attachment.filename for attachment in message.attachments)
+                    )
+                if not parts:
+                    continue
+
+                timestamp = message.created_at.isoformat()
+                author = getattr(message.author, "display_name", None) or str(message.author)
+                transcript_blocks.append(f"[{timestamp}] {author}\n" + "\n".join(parts))
+                message_count += 1
+
+            transcript = "\n\n---\n\n".join(transcript_blocks)
+
+        audit_input = transcript
+        if staff_context:
+            context_block = "[Staff-provided command context]\n" + staff_context
+            audit_input = f"{audit_input}\n\n---\n\n{context_block}" if audit_input else context_block
+        if staff_attachment_context:
+            attachment_block = "[Staff-attached text files]\n" + staff_attachment_context
+            audit_input = (
+                f"{audit_input}\n\n---\n\n{attachment_block}"
+                if audit_input
+                else attachment_block
+            )
+        generator = generator_cls(
+            self.bot.session,
+            str(api_key),
+            model=str(self.bot.config.get("gemini_model") or "gemini-3.5-flash-lite"),
+            timeout_seconds=30,
+        )
+
+        response = None
+        delivery_error = None
+        async with safe_typing(ctx):
+            response = await generator.generate(
+                transcript,
+                staff_context=staff_context,
+                staff_attachment_context=staff_attachment_context,
+            )
+            if response is not None:
+                unsupported_commands = find_command_references(response)
+                if unsupported_commands:
+                    command_list = ", ".join(
+                        f"{self.bot.prefix}{command}"
+                        for command in sorted(unsupported_commands)
+                    )
+                    response = await generator.generate(
+                        transcript,
+                        correction=(
+                            f"The previous draft invented or used unapproved command(s): "
+                            f"{command_list}. Do not mention any Discord command. Answer using "
+                            "verified information only; if the request is unclear, ask one concise "
+                            "clarification question."
+                        ),
+                        staff_context=staff_context,
+                        staff_attachment_context=staff_attachment_context,
+                    )
+                    if response is None or find_command_references(response):
+                        response = (
+                            "I do not have enough verified information to answer that request. "
+                            "Could you clarify exactly what you need help with?"
+                        )
+                        generator.last_outcome = "safety_fallback"
+                        generator.last_detail = (
+                            "Blocked repeated unsupported Discord command references."
+                        )
+            if response is not None:
+                # Leave extra room in raw mode for its disclosure and code-block wrapper.
+                maximum_response_length = 3_850 if staff_only else 4_000
+                response = finalize_generated_ai_reply(
+                    response,
+                    include_closing=include_closing,
+                    closing_text=closing_text,
+                    maximum_length=maximum_response_length,
+                )
+                try:
+                    if staff_only:
+                        raw_text = f"{response}\n\n{AI_REPLY_FOOTER}"
+                        await ctx.send(
+                            embed=discord.Embed(
+                                description=f"```\n{escape_code_block(raw_text)}\n```",
+                                color=self.bot.main_color,
+                            )
+                        )
+                    else:
+                        await ctx.thread._send_ai_autoreply(log_name, response)
+                except Exception as exc:
+                    delivery_error = exc
+
+        if response is None:
+            await ctx.thread._log_ai_check(
+                ctx.message,
+                audit_input,
+                outcome=generator.last_outcome,
+                detail=generator.last_detail or "Gemini did not generate a reply.",
+                selected_name=command_name,
+                delivery_status="No AI reply was sent.",
+            )
+            await ctx.send(
+                embed=discord.Embed(
+                    color=self.bot.error_color,
+                    description=generator.last_detail or "Gemini could not generate a reply.",
+                )
+            )
+            return False
+
+        if delivery_error is not None:
+            await ctx.thread._log_ai_check(
+                ctx.message,
+                audit_input,
+                outcome="delivery_error",
+                detail=(
+                    f"Gemini generated a reply, but Discord delivery failed "
+                    f"({type(delivery_error).__name__})."
+                ),
+                selected_name=command_name,
+                response_text=response,
+                delivery_status=(
+                    f"Staff-only {tone_label} AI draft delivery failed."
+                    if staff_only
+                    else f"Manual {tone_label} AI reply delivery failed."
+                ),
+            )
+            raise delivery_error
+
+        delivery_status = (
+            f"Staff-only {tone_label} AI draft generated; nothing was sent to the recipient."
+            if staff_only
+            else f"Manual {tone_label} AI reply delivered."
+        )
+        await ctx.thread._log_ai_check(
+            ctx.message,
+            audit_input,
+            outcome=generator.last_outcome,
+            detail=f"Generated from {message_count} thread messages.",
+            selected_name=command_name,
+            response_text=response,
+            delivery_status=delivery_status,
+        )
+        if not staff_only:
+            self.bot.dispatch("thread_reply", ctx.thread, True, ctx.message, False, False)
+        return True
+
+    async def _resolve_aiall_thread(self, ctx) -> None:
+        """Move and rename a successfully answered ticket, then schedule its closure."""
+        resolved_category = ctx.guild.get_channel(RESOLVED_CATEGORY_ID)
+        if not isinstance(resolved_category, discord.CategoryChannel):
+            raise commands.ChannelNotFound(str(RESOLVED_CATEGORY_ID))
+
+        await ctx.channel.move(
+            category=resolved_category,
+            end=True,
+            sync_permissions=True,
+            reason=f"aiall marked resolved by {ctx.author}",
+        )
+        await ctx.channel.edit(
+            name="resolved",
+            reason=f"aiall marked resolved by {ctx.author}",
+        )
+        await ctx.thread.close(closer=ctx.author, after=24 * 60 * 60)
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    async def aicommands(self, ctx):
+        """Show the available manual AI commands and autoreply management syntax."""
+        prefix = self.bot.prefix
+        embed = discord.Embed(
+            title="AI command guide",
+            description=(
+                "Commands for generating replies, preparing staff-only drafts, and managing "
+                "automatic ticket responses."
+            ),
+            color=self.bot.main_color,
+        )
+        embed.add_field(
+            name="Generate and send",
+            value=(
+                f"`{prefix}aireply [CONTEXT]` — Generate and send a helpful response; optional "
+                "staff context guides the draft.\n"
+                f"`{prefix}aiall` — Answer any unresolved question, then send the closure warning.\n"
+                f"`{prefix}aiclose` / `{prefix}aibye` — Send the AI closure reply and close immediately.\n"
+                f"`{prefix}airude` — Send the abuse warning and close immediately.\n"
+                f"`{prefix}aisummarise` — Summarise the complete ticket for staff only.\n"
+                f"`{prefix}aitest [stop]` — Continuously handle the ticket until a human is required.\n"
+                f"`{prefix}annoyautoreply` — Generate and send the sarcastic response.\n"
+                f"`{prefix}fakeautoreply MESSAGE` — Send your own text using the AI presentation.\n"
+                f"`{prefix}aisort` — Review every open ticket in one Gemini request.\n"
+                f"`{prefix}aisort1` — Review only the current ticket with Gemini."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Staff-only raw drafts",
+            value=(
+                f"`{prefix}aifeed MESSAGE` — Add trusted ticket-specific context for onboarding "
+                "without replying to the recipient or interrupting intake.\n"
+                f"`{prefix}aireply raw [CONTEXT]` — Generate a helpful copyable draft without "
+                "sending it.\n"
+                f"`{prefix}aiall raw` — Prepare the same closure reply without sending it."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Automatic autoreplies — Administrator",
+            value=(
+                f"`{prefix}autoreply` — List all configured rules.\n"
+                f"`{prefix}autoreply KEYWORD` — View one rule and its alternatives.\n"
+                f"`{prefix}autoreply KEYWORD raw` — Get a copyable edit command.\n"
+                f"`{prefix}autoreply create \"NAME: …\" "
+                "[\"MUST MENTION TO CHECK\": …] ALIAS` — Create a rule.\n"
+                f"`{prefix}autoreply edit …` — Update a rule, including `ALTERNATIVES`.\n"
+                '`["ADDITIONAL INFO": "…"]` — Optional trusted selection guidance at the end.\n'
+                f"`{prefix}autoreply remove KEYWORD` — Delete a rule."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="AI-message cleanup",
+            value=(
+                f"`{prefix}delete` — Delete the latest linked reply.\n"
+                f"`{prefix}delete MESSAGE_ID` — Delete a specific linked AI/staff reply."
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Automatic alias helpers",
+            value=(
+                '`"context MESSAGE"` — Post plain staff-only context in the ticket.\n'
+                '`"notify @role"` — Immediately ping a role in the staff ticket.'
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="Automatic abuse filter — Administrator",
+            value=(
+                f"`{prefix}abuseword add WORD OR PHRASE` — Add a persistent custom entry.\n"
+                f"`{prefix}abuseword remove WORD OR PHRASE` — Remove a custom entry.\n"
+                f"`{prefix}abuseword list` — List custom entries."
+            ),
+            inline=False,
+        )
+        embed.set_footer(
+            text="Fully automatic ticket checks and URL responses run without a command."
+        )
+        return await ctx.send(embed=embed)
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def aireply(self, ctx, *, argument: str = ""):
+        """Generate a response from the conversation using the optional prompt as what to say."""
+        staff_only, staff_context = parse_aireply_argument(argument)
+        attachment_blocks = []
+        total_attachment_bytes = 0
+        for attachment in ctx.message.attachments:
+            if not attachment.filename.casefold().endswith(AI_TEXT_ATTACHMENT_EXTENSIONS):
+                continue
+            if attachment.size > AI_TEXT_ATTACHMENT_MAX_BYTES:
+                raise commands.BadArgument(
+                    f"`{attachment.filename}` exceeds the {AI_TEXT_ATTACHMENT_MAX_BYTES:,}-byte "
+                    "limit for AI text attachments."
+                )
+            payload = await attachment.read()
+            total_attachment_bytes += len(payload)
+            if total_attachment_bytes > AI_TEXT_ATTACHMENT_MAX_BYTES * 2:
+                raise commands.BadArgument("AI text attachments cannot exceed 400,000 bytes in total.")
+            try:
+                text_content = decode_ai_text_attachment(attachment.filename, payload)
+            except ValueError as exc:
+                raise commands.BadArgument(str(exc)) from exc
+            attachment_blocks.append(
+                f"[FILE: {attachment.filename}]\n{text_content}\n[END FILE]"
+            )
+        await self._send_generated_ai_reply(
+            ctx,
+            GeminiHelpfulReplyGenerator,
+            command_name="aireply raw" if staff_only else "aireply",
+            log_name="Manual helpful AI reply",
+            tone_label="helpful",
+            staff_only=staff_only,
+            include_closing=False,
+            relay_context_only=True,
+            staff_context=staff_context,
+            staff_attachment_context="\n\n".join(attachment_blocks),
+        )
+
+    @commands.command(aliases=["aisummarize"])
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def aisummarise(self, ctx):
+        """Summarise the complete ticket channel for staff without replying to the recipient."""
+        await self._send_generated_ai_reply(
+            ctx,
+            GeminiTicketChannelSummaryGenerator,
+            command_name="aisummarise",
+            log_name="Staff-only ticket summary",
+            tone_label="ticket summary",
+            staff_only=True,
+            include_closing=False,
+        )
+
+    @commands.command(aliases=["saireply"])
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def smartaireply(self, ctx, *, argument: str = ""):
+        """Generate an AI reply using the persistent support knowledge base as context."""
+        staff_only, staff_context = parse_aireply_argument(argument)
+        knowledge_base = await self._get_smart_ai_context()
+        await self._send_generated_ai_reply(
+            ctx,
+            GeminiHelpfulReplyGenerator,
+            command_name="smartaireply raw" if staff_only else "smartaireply",
+            log_name="Manual smart AI reply",
+            tone_label="smart helpful",
+            staff_only=staff_only,
+            include_closing=False,
+            relay_context_only=True,
+            staff_context=staff_context,
+            staff_attachment_context=(
+                "[FILE: TUI_Airways_Roblox_Smart_AI_Context.md]\n"
+                + knowledge_base
+                + "\n[END FILE]"
+            ),
+        )
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def aiall(self, ctx, mode: str = None):
+        """Answer supported unresolved questions and send the all-inquiries closing."""
+        normalized_mode = mode.casefold() if mode is not None else None
+        if normalized_mode not in {None, "raw"}:
+            raise commands.BadArgument(
+                f"Use `{self.bot.prefix}aiall` or `{self.bot.prefix}aiall raw`."
+            )
+
+        staff_only = normalized_mode == "raw"
+        if not staff_only:
+            await ctx.thread.ensure_staff_reply_subscription(ctx.author, ctx.message)
+        skip_ai_check = False
+        if not staff_only:
+            try:
+                log_entry = await self.bot.api.get_log(ctx.channel.id)
+            except Exception:
+                logger.warning(
+                    "Could not determine the latest relayed author for aiall; running Gemini.",
+                    exc_info=True,
+                )
+            else:
+                skip_ai_check = bool(
+                    log_entry
+                    and last_relayed_message_is_human_staff(
+                        log_entry.get("messages") or [],
+                        bot_user_id=self.bot.user.id,
+                    )
+                    is True
+                )
+
+        if skip_ai_check:
+            await ctx.thread._send_ai_autoreply(
+                "Manual all-inquiries closure",
+                AI_ALL_CLOSING,
+            )
+            await ctx.thread._log_ai_check(
+                ctx.message,
+                "Latest relayed message was sent by human staff.",
+                outcome="skipped",
+                detail="Skipped the aiall Gemini review because human staff sent the latest relayed message.",
+                selected_name="aiall",
+                response_text=AI_ALL_CLOSING,
+                delivery_status="All-inquiries closure warning delivered without a Gemini request.",
+            )
+            delivered = True
+        else:
+            delivered = await self._send_generated_ai_reply(
+                ctx,
+                GeminiTicketSummaryGenerator,
+                command_name="aiall raw" if staff_only else "aiall",
+                log_name="Manual all-inquiries AI check",
+                tone_label="all-inquiries check",
+                staff_only=staff_only,
+                include_closing=True,
+                closing_text=AI_ALL_CLOSING,
+            )
+
+        if delivered and not staff_only:
+            ctx.thread._all_closure_alias_ran = True
+            await self._resolve_aiall_thread(ctx)
+
+    @commands.command()
+    @checks.has_any_role_id(*MANUAL_AI_ROLE_IDS)
+    @checks.thread_only()
+    async def annoyautoreply(self, ctx):
+        """Generate and send a sarcastic AI response using the complete thread history."""
+        await self._send_generated_ai_reply(
+            ctx,
+            GeminiAnnoyReplyGenerator,
+            command_name="annoyautoreply",
+            log_name="Manual annoy autoreply",
+            tone_label="sarcastic",
+        )
+
+    @commands.command(aliases=["caseopen", "hrcaseopen"])
+    @checks.has_any_role_id(HR_CASE_ROLE_ID)
+    @checks.thread_only()
+    async def caseopened(self, ctx):
+        """Send the formal HR case acknowledgment to the current ticket."""
+        case_numbers = self.bot.config["hr_case_numbers"]
+        channel_id = str(ctx.channel.id)
+        case_id = case_numbers.get(channel_id)
+        if not case_id:
+            used_ids = {str(value).upper() for value in case_numbers.values()}
+            alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+            case_id = "".join(secrets.choice(alphabet) for _ in range(6))
+            while case_id in used_ids:
+                case_id = "".join(secrets.choice(alphabet) for _ in range(6))
+            case_numbers[channel_id] = case_id
+            await self.bot.config.update()
+
+        msg = (
+            f"**Case Opened: {str(case_id).upper()}**\n\n"
+            "Thank you for reaching out to us regarding your concern, we have now opened "
+            "a formal investigation into the matter listed above.\n\n"
+            "Whilst we aim to handle all reports as thoroughly and quickly as possible, "
+            "this sometimes can take longer so please avoid spam pinging or requesting followups.\n\n"
+            "If you have any additional information, please share that **now**, in "
+            "**as much detail** as possible.\n\n"
+            "Many thanks,\nHuman Resources."
+        )
         ctx.message.content = msg
         async with safe_typing(ctx):
             await ctx.thread.reply(ctx.message, msg)
@@ -2695,6 +4568,14 @@ class Modmail(commands.Cog):
 
     async def cog_load(self):
         self.snooze_auto_unsnooze.start()
+        self.unanswered_reply_reminders.start()
+        self.scheduled_ai_sort.start()
+
+    def cog_unload(self):
+        self.snooze_auto_unsnooze.cancel()
+        self.unanswered_reply_reminders.cancel()
+        self.scheduled_ai_sort.cancel()
+        self._auto_unsnooze_task.cancel()
 
     @tasks.loop(seconds=10)
     async def snooze_auto_unsnooze(self):

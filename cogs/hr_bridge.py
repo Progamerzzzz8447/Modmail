@@ -1,0 +1,213 @@
+"""Secure Discord -> E-Crew Human Resources case bridge."""
+
+import asyncio
+import re
+import secrets
+import string
+from typing import Optional
+
+import discord
+from discord.ext import commands
+
+from core.models import getLogger
+
+logger = getLogger(__name__)
+CASE_NAME_RE = re.compile(r"^([a-z0-9]{6})-unclaimed$")
+LEGACY_CASE_NAME_RE = re.compile(r"^case-([a-z0-9]{6})$")
+CASE_ALPHABET = string.ascii_uppercase + string.digits
+
+
+class HumanResourcesBridge(commands.Cog):
+    """Keep HR case records in sync without mirroring ticket messages."""
+
+    def __init__(self, bot):
+        self.bot = bot
+        self._case_channels = set()
+        self._sync_locks = {}
+        self._last_error = None
+
+    @property
+    def enabled(self):
+        return bool(self._portal_url and self._secret and self._category_id)
+
+    def _configuration_problem(self):
+        missing = []
+        if not self._portal_url:
+            missing.append("HR_PORTAL_URL")
+        if not self._secret:
+            missing.append("HR_BOT_SECRET")
+        if not self._category_id:
+            missing.append("HR_DISCORD_CATEGORY_ID (or a category named Human Resources)")
+        return ", ".join(missing)
+
+    @property
+    def _portal_url(self):
+        return str(self.bot.config.get("hr_portal_url", convert=False) or "").rstrip("/")
+
+    @property
+    def _secret(self):
+        return str(self.bot.config.get("hr_bot_secret", convert=False) or "")
+
+    @property
+    def _category_id(self):
+        value = self.bot.config.get("hr_discord_category_id", convert=False)
+        try:
+            if value:
+                return int(value)
+        except (TypeError, ValueError):
+            pass
+        guild = getattr(self.bot, "modmail_guild", None)
+        if guild:
+            category = discord.utils.find(
+                lambda item: item.name.strip().lower() in {"human resources", "hr"},
+                guild.categories,
+            )
+            if category:
+                return category.id
+        return None
+
+    def _is_hr_channel(self, channel):
+        return (
+            self.enabled
+            and isinstance(channel, discord.TextChannel)
+            and getattr(channel, "category_id", None) == self._category_id
+        )
+
+    async def _post(self, payload):
+        if not self.enabled:
+            return None
+        url = f"{self._portal_url}/functions/v1/hr-cases"
+        try:
+            async with self.bot.session.post(
+                url,
+                json=payload,
+                headers={"x-bot-secret": self._secret},
+                timeout=20,
+            ) as response:
+                body = await response.text()
+                if response.status >= 300:
+                    self._last_error = f"HTTP {response.status}: {body[:500]}"
+                    logger.error("HR bridge returned HTTP %s: %s", response.status, body[:1000])
+                    return None
+                self._last_error = None
+                return await response.json()
+        except Exception as exc:
+            self._last_error = f"{type(exc).__name__}: {exc}"
+            logger.error("HR bridge request failed.", exc_info=True)
+            return None
+
+    @staticmethod
+    def _new_case_number():
+        return "".join(secrets.choice(CASE_ALPHABET) for _ in range(6))
+
+    async def _case_number_for_channel(self, channel):
+        stored = self.bot.config["hr_case_numbers"].get(str(channel.id))
+        if stored:
+            return str(stored).upper(), False, False
+        current = CASE_NAME_RE.match(channel.name)
+        legacy = LEGACY_CASE_NAME_RE.match(channel.name)
+        match = current or legacy
+        case_number = match.group(1).upper() if match else self._new_case_number()
+        self.bot.config["hr_case_numbers"][str(channel.id)] = case_number
+        await self.bot.config.update()
+        return case_number, match is None, legacy is not None
+
+    async def _thread_for_channel(self, channel):
+        try:
+            return await self.bot.threads.find(channel=channel)
+        except Exception:
+            return None
+
+    async def _ensure_case(self, channel, *, backfill=False):
+        if not self._is_hr_channel(channel):
+            return None
+        lock = self._sync_locks.setdefault(channel.id, asyncio.Lock())
+        async with lock:
+            case_number, newly_assigned, legacy_name = await self._case_number_for_channel(channel)
+            if newly_assigned or legacy_name:
+                try:
+                    channel = await channel.edit(
+                        name=f"{case_number.lower()}-unclaimed",
+                        reason="Human Resources case assigned",
+                    )
+                except discord.HTTPException:
+                    logger.warning("Could not rename HR ticket channel %s.", channel.id, exc_info=True)
+
+            thread = await self._thread_for_channel(channel)
+            recipient = getattr(thread, "recipient", None)
+            result = await self._post({
+                "event": "case_upsert",
+                "case": {
+                    "case_number": case_number,
+                    "discord_channel_id": str(channel.id),
+                    "discord_guild_id": str(channel.guild.id),
+                    "recipient_id": str(getattr(recipient, "id", "")) or None,
+                    "recipient_name": str(recipient) if recipient else None,
+                    "recipient_avatar_url": str(getattr(getattr(recipient, "display_avatar", None), "url", "")) or None,
+                    "channel_name": channel.name,
+                    "status": "open",
+                },
+            })
+            if result:
+                self._case_channels.add(channel.id)
+            return result
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self.enabled:
+            logger.warning("HR bridge disabled; missing %s.", self._configuration_problem())
+            return
+        category = self.bot.get_channel(self._category_id)
+        if isinstance(category, discord.CategoryChannel):
+            for channel in category.text_channels:
+                self.bot.loop.create_task(self._ensure_case(channel, backfill=True))
+
+    @commands.command(name="hrsync")
+    @commands.is_owner()
+    async def hr_sync(self, ctx):
+        """Validate the HR bridge and backfill every ticket in its category."""
+        if not self.enabled:
+            await ctx.send(f"HR bridge is disabled. Missing: `{self._configuration_problem()}`.")
+            return
+        category = self.bot.get_channel(self._category_id)
+        if not isinstance(category, discord.CategoryChannel):
+            await ctx.send("The configured Human Resources category could not be found.")
+            return
+        status = await ctx.send(f"Synchronizing {len(category.text_channels)} HR ticket(s)…")
+        succeeded = 0
+        for channel in category.text_channels:
+            if await self._ensure_case(channel, backfill=True):
+                succeeded += 1
+        result = f"HR synchronization complete: {succeeded}/{len(category.text_channels)} ticket(s) synchronized."
+        if self._last_error:
+            result += f"\nLast bridge error: `{self._last_error[:1500]}`"
+        await status.edit(content=result)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_update(self, before, after):
+        if self._is_hr_channel(after) and getattr(before, "category_id", None) != self._category_id:
+            await self._ensure_case(after, backfill=True)
+        elif self._is_hr_channel(after) and before.name != after.name:
+            await self._ensure_case(after)
+
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel):
+        if channel.id in self._case_channels:
+            await self._post({"event": "case_delete", "discord_channel_id": str(channel.id)})
+            self._case_channels.discard(channel.id)
+
+    @commands.Cog.listener()
+    async def on_thread_ready(self, thread, creator, category, initial_message):
+        if self._is_hr_channel(getattr(thread, "channel", None)):
+            await self._ensure_case(thread.channel, backfill=True)
+
+    @commands.Cog.listener()
+    async def on_thread_close(self, thread, closer, silent, delete_channel, message, scheduled):
+        channel = getattr(thread, "channel", None)
+        if channel and channel.id in self._case_channels:
+            await self._post({"event": "case_close", "discord_channel_id": str(channel.id)})
+            self._case_channels.discard(channel.id)
+
+
+async def setup(bot):
+    await bot.add_cog(HumanResourcesBridge(bot))

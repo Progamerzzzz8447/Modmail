@@ -37,6 +37,34 @@ def has_permissions(permission_level: PermissionLevel = PermissionLevel.REGULAR)
     return commands.check(has_permissions_predicate(permission_level))
 
 
+def has_any_role_id(*role_ids: int):
+    """Require the invoking member to have at least one exact Discord role ID.
+
+    This check is intentionally independent of Modmail's permission hierarchy:
+    owners and server administrators must still hold one of the supplied roles.
+    """
+    allowed_role_ids = frozenset(int(role_id) for role_id in role_ids)
+
+    async def predicate(ctx):
+        author_roles = getattr(ctx.author, "roles", ())
+        return any(getattr(role, "id", None) in allowed_role_ids for role in author_roles)
+
+    formatted_roles = " or ".join(f"<@&{role_id}>" for role_id in allowed_role_ids)
+    predicate.fail_msg = f"Only members with {formatted_roles} may use this command."
+    return commands.check(predicate)
+
+
+def has_user_id(*user_ids: int):
+    """Require the invoking account to have one of the supplied exact Discord user IDs."""
+    allowed_user_ids = frozenset(int(user_id) for user_id in user_ids)
+
+    async def predicate(ctx):
+        return getattr(ctx.author, "id", None) in allowed_user_ids
+
+    predicate.fail_msg = "You are not permitted to use this restricted command."
+    return commands.check(predicate)
+
+
 async def check_permissions(ctx, command_name) -> bool:
     """Logic for checking permissions for a command for a user"""
     if await ctx.bot.is_owner(ctx.author) or ctx.author.id == ctx.bot.user.id:

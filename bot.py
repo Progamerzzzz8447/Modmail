@@ -17,7 +17,7 @@ from types import SimpleNamespace
 
 import discord
 import isodate
-from aiohttp import ClientSession, ClientResponseError
+from aiohttp import ClientSession, ClientResponseError, web
 from discord.ext import commands, tasks
 from discord.ext.commands.view import StringView
 from emoji import is_emoji
@@ -33,6 +33,7 @@ except ImportError:
     pass
 
 from core import checks
+from core.alias_parser import DeferredDeleteMessage, normalize_compact_fakeautoreply_invocation
 from core.changelog import Changelog
 from core.clients import ApiClient, MongoDBClient, PluginDatabaseClient
 from core.config import ConfigManager
@@ -58,6 +59,11 @@ from core.utils import (
 )
 
 logger = getLogger(__name__)
+
+COMMAND_DISABLED_GUILD_IDS = frozenset({
+    1308444031188992090,
+    1393691971612184658,
+})
 
 temp_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "temp")
 if not os.path.exists(temp_dir):
@@ -88,6 +94,7 @@ class ModmailBot(commands.Bot):
             "cogs.plugins",
             "cogs.utility",
             "cogs.threadmenu",
+            "cogs.hr_bridge",
         ]
         self._connected = None
         self.start_time = discord.utils.utcnow()
@@ -227,6 +234,24 @@ class ModmailBot(commands.Bot):
             async with self:
                 self._connected = asyncio.Event()
                 self.session = ClientSession(loop=self.loop)
+                health_runner = web.AppRunner(
+                    web.Application()
+                )
+                health_runner.app.router.add_get(
+                    "/",
+                    lambda request: web.json_response({"status": "ok", "service": "modmail"}),
+                )
+                health_runner.app.router.add_get(
+                    "/health",
+                    lambda request: web.json_response({"status": "ok"}),
+                )
+                await health_runner.setup()
+                await web.TCPSite(
+                    health_runner,
+                    "0.0.0.0",
+                    int(os.environ.get("PORT", "10000")),
+                ).start()
+                logger.info("Health server listening on port %s.", os.environ.get("PORT", "10000"))
 
                 if self.config["enable_presence_intent"]:
                     logger.info("Starting bot with presence intent.")
@@ -244,6 +269,7 @@ class ModmailBot(commands.Bot):
                 except Exception:
                     logger.critical("Fatal exception", exc_info=True)
                 finally:
+                    await health_runner.cleanup()
                     if self.session:
                         await self.session.close()
                     if not self.is_closed():
@@ -1002,6 +1028,8 @@ class ModmailBot(commands.Bot):
                 forwarded_msg = ForwardedMessage(message, combined_content)
                 await thread.send(forwarded_msg)
                 await self.add_reaction(message, sent_emoji)
+                if await thread.auto_close_for_abuse(forwarded_msg):
+                    return
                 self.dispatch("thread_reply", thread, False, message, False, False)
                 return
             else:
@@ -1092,6 +1120,8 @@ class ModmailBot(commands.Bot):
                     forwarded_msg = ForwardedMessage(message, ref_msg)
                     await thread.send(forwarded_msg)
                     await self.add_reaction(message, sent_emoji)
+                    if await thread.auto_close_for_abuse(forwarded_msg):
+                        return
                     self.dispatch("thread_reply", thread, False, message, False, False)
                     return
                 else:
@@ -1222,6 +1252,8 @@ class ModmailBot(commands.Bot):
                                                     exc_info=True,
                                                 )
                                     await self.add_reaction(message, sent_emoji)
+                                    if await new_thread.auto_close_for_abuse(message):
+                                        return
                                     self.dispatch(
                                         "thread_reply",
                                         new_thread,
@@ -1246,6 +1278,8 @@ class ModmailBot(commands.Bot):
                             logger.error("Failed to send message:", exc_info=True)
 
                 await self.add_reaction(message, sent_emoji)
+                if await thread.auto_close_for_abuse(message):
+                    return
                 self.dispatch("thread_reply", thread, False, message, False, False)
 
     def _get_snippet_command(self) -> commands.Command:
@@ -1279,6 +1313,19 @@ class ModmailBot(commands.Bot):
 
         invoker = view.get_word().lower()
 
+        # Be forgiving when staff omit the space in
+        # ``?fakeautoreply Message``. Keep this intentionally command-specific
+        # so prefix matching cannot alter any other command or alias.
+        if self.all_commands.get(invoker) is None:
+            normalized_invocation = normalize_compact_fakeautoreply_invocation(
+                message.content, invoked_prefix
+            )
+            if normalized_invocation is not None:
+                view = StringView(normalized_invocation)
+                discord.utils.find(view.skip_string, prefixes)
+                invoker = view.get_word().lower()
+                ctx.view = view
+
         # Check if a snippet is being called.
         # This needs to be done before checking for aliases since
         # snippets can have multiple words.
@@ -1287,9 +1334,15 @@ class ModmailBot(commands.Bot):
             snippet_text = self.snippets[message.content[len(invoked_prefix) :]]
         except KeyError:
             snippet_text = None
+        protected_commands = {"transfer", "caseopened", "caseopen", "hrcaseopen"}
+        if invoker in protected_commands and self.all_commands.get(invoker) is not None:
+            snippet_text = None
 
         # Check if there is any aliases being called.
         alias = self.aliases.get(invoker)
+        # Saved aliases must not shadow these first-class commands.
+        if invoker in protected_commands and self.all_commands.get(invoker) is not None:
+            alias = None
         if alias is not None and snippet_text is None:
             ctxs = []
             aliases = normalize_alias(alias, message.content[len(f"{invoked_prefix}{invoker}") :])
@@ -1297,6 +1350,13 @@ class ModmailBot(commands.Bot):
                 logger.warning("Alias %s is invalid, removing.", invoker)
                 self.aliases.pop(invoker)
 
+            alias_grants_subscription = any(
+                step.strip().split(maxsplit=1)[0].casefold() in {"sub", "subscribe"}
+                for step in aliases
+                if step.strip()
+            )
+
+            context_message = DeferredDeleteMessage(message) if len(aliases) > 1 else message
             for alias in aliases:
                 command = None
                 try:
@@ -1307,8 +1367,10 @@ class ModmailBot(commands.Bot):
                     command = self._get_snippet_command()
                     command_invocation_text = f"{invoked_prefix}{command} {snippet_text}"
                 view = StringView(invoked_prefix + command_invocation_text)
-                ctx_ = cls(prefix=self.prefix, view=view, bot=self, message=message)
+                ctx_ = cls(prefix=self.prefix, view=view, bot=self, message=context_message)
                 ctx_.thread = thread
+                ctx_._manual_alias_name = invoker
+                ctx_._alias_grants_subscription = alias_grants_subscription
                 discord.utils.find(view.skip_string, prefixes)
                 ctx_.invoked_with = view.get_word().lower()
                 ctx_.command = command or self.all_commands.get(ctx_.invoked_with)
@@ -1488,8 +1550,27 @@ class ModmailBot(commands.Bot):
             return await self._queue_dm_message(message)
 
         ctxs = await self.get_contexts(message)
+        commands_disabled = (
+            message.guild is not None
+            and message.guild.id in COMMAND_DISABLED_GUILD_IDS
+        )
+        deferred_message = next(
+            (
+                ctx.message
+                for ctx in ctxs
+                if isinstance(ctx.message, DeferredDeleteMessage)
+            ),
+            None,
+        )
         for ctx in ctxs:
             if ctx.command:
+                if commands_disabled:
+                    logger.info(
+                        "Ignored command %s in command-disabled guild %s.",
+                        ctx.command.qualified_name,
+                        message.guild.id,
+                    )
+                    continue
                 if not any(1 for check in ctx.command.checks if hasattr(check, "permission_level")):
                     logger.debug(
                         "Command %s has no permissions check, adding invalid level.",
@@ -1509,7 +1590,29 @@ class ModmailBot(commands.Bot):
                             logger.warning("Failed to add queued-reaction: %s", e)
                         continue
 
-                await self.invoke(ctx)
+                alias_bypass_author_id = None
+                if thread is not None and getattr(ctx, "_alias_grants_subscription", False):
+                    alias_bypass_author_id = getattr(ctx.author, "id", None)
+                    if alias_bypass_author_id is not None:
+                        thread._alias_subscription_bypass_authors.add(alias_bypass_author_id)
+                try:
+                    await self.invoke(ctx)
+                finally:
+                    if alias_bypass_author_id is not None:
+                        thread._alias_subscription_bypass_authors.discard(alias_bypass_author_id)
+                if (
+                    thread is not None
+                    and not getattr(ctx, "command_failed", False)
+                    and getattr(ctx, "_manual_alias_name", "").casefold() == "all"
+                ):
+                    thread._all_closure_alias_ran = True
+                if (
+                    thread is not None
+                    and not getattr(ctx, "command_failed", False)
+                    and getattr(ctx, "_manual_alias_name", "").casefold()
+                    in {"subqual", "subqualification"}
+                ):
+                    thread.begin_subqual_request()
                 continue
 
             thread = await self.threads.find(channel=ctx.channel)
@@ -1553,6 +1656,15 @@ class ModmailBot(commands.Bot):
             elif ctx.invoked_with:
                 exc = commands.CommandNotFound('Command "{}" is not found'.format(ctx.invoked_with))
                 self.dispatch("command_error", ctx, exc)
+
+        if deferred_message is not None:
+            try:
+                await deferred_message.finalize_delete()
+            except discord.NotFound:
+                # Another command or moderator may already have removed it.
+                pass
+            except discord.Forbidden:
+                logger.warning("Could not delete a completed multi-step alias message.")
 
     async def on_typing(self, channel, user, _):
         await self.wait_for_connected()

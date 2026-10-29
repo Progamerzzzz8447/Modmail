@@ -40,6 +40,20 @@ class ConfigManager:
         "reply_without_command": False,
         "anon_reply_without_command": False,
         "plain_reply_without_command": False,
+        # AI autoreplies
+        "gemini_ai_enabled": True,
+        "gemini_model": "gemini-3.5-flash-lite",
+        "gemini_log_channel_id": "1526602233737773146",
+        "smart_ai_context": "",
+        # Scheduled Gemini batch ticket reviews
+        "ai_sort_enabled": True,
+        "ai_sort_model": "gemini-3.5-flash",
+        "ai_sort_log_channel_id": "1528151308799049921",
+        # recipient reply reminders
+        "recipient_reply_reminder_delay": 43_200,
+        "recipient_reply_reminder_text": (
+            "The recipient is still awaiting a staff response. Please reply to this ticket."
+        ),
         # logging
         "log_channel_id": None,
         "mention_channel_id": None,
@@ -71,6 +85,7 @@ class ConfigManager:
         "thread_creation_contact_response": "{creator.name} has opened a Modmail thread.",
         "thread_creation_title": "Thread Created",
         "thread_creation_send_dm_embed": True,
+        "message_embeds_v2": False,
         "thread_close_footer": "Replying will create a new thread",
         "thread_close_title": "Thread Closed",
         "thread_close_response": "{closer.mention} has closed this Modmail thread.",
@@ -177,6 +192,7 @@ class ConfigManager:
         "blocked": {},
         "blocked_roles": {},
         "blocked_whitelist": [],
+        "abuse_filter_extra_terms": [],
         "command_permissions": {},
         "level_permissions": {},
         "override_command_level": {},
@@ -184,6 +200,9 @@ class ConfigManager:
         "snippets": {},
         "notification_squad": {},
         "subscriptions": {},
+        "autoreplies": {},
+        "reply_reminders": {},
+        "hr_case_numbers": {},
         "closures": {},
         # Thread creation menu
         "thread_creation_menu_enabled": False,
@@ -213,6 +232,12 @@ class ConfigManager:
         "enable_eval": True,
         # github access token for private repositories
         "github_token": None,
+        # Gemini API credentials must only be supplied via the environment.
+        "gemini_api_key": None,
+        # HR case bridge credentials. These are environment-only secrets.
+        "hr_portal_url": "https://kumgbyivglbzwrmkrqcp.supabase.co",
+        "hr_bot_secret": None,
+        "hr_discord_category_id": None,
         "disable_autoupdates": False,
         "disable_updates": False,
         # Logging
@@ -240,7 +265,7 @@ class ConfigManager:
         "log_expiration",
     }
 
-    duration_seconds = {"snooze_default_duration"}
+    duration_seconds = {"snooze_default_duration", "recipient_reply_reminder_delay"}
 
     booleans = {
         "use_user_id_channel_name",
@@ -285,12 +310,14 @@ class ConfigManager:
         "snooze_store_attachments",
         # thread creation menu booleans
         "thread_creation_send_dm_embed",
+        "message_embeds_v2",
         "thread_creation_menu_enabled",
         "thread_creation_menu_close_on_timeout",
         "thread_creation_menu_anonymous_menu",
         "thread_creation_menu_selection_log",
         "thread_creation_menu_precreate_channel",
         "thread_creation_menu_embed_large_image",
+        "gemini_ai_enabled",
     }
 
     enums = {

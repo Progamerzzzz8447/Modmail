@@ -1,4 +1,97 @@
 {
+  "smart_ai_context": {
+    "default": "Bundled TUI Airways Roblox support knowledge base",
+    "description": "Persistent Markdown context used by `{prefix}smartaireply` / `{prefix}saireply`.",
+    "examples": [
+      "Use `{prefix}context raw` to download it.",
+      "Use `{prefix}context edit` with an attached text or Markdown file to replace it."
+    ],
+    "notes": [
+      "The context is supplied to Gemini as trusted reference material, not as a recipient message or staff instruction."
+    ]
+  },
+  "gemini_ai_enabled": {
+    "default": "Yes",
+    "description": "Scans every recipient message for configured wording, then uses Gemini to select a relevant configured `{prefix}autoreply` message that has not already been sent in that ticket.",
+    "examples": [
+      "`{prefix}config set gemini_ai_enabled yes`",
+      "`{prefix}config set gemini_ai_enabled no`"
+    ],
+    "notes": [
+      "Requires the `GEMINI_API_KEY` environment variable and at least one configured `{prefix}autoreply`.",
+      "Gemini selects an existing set message or a configured reply/freply alias; it does not compose the reply.",
+      "Alias-backed rules call Gemini whenever a recipient message contains a configured must-mention word or phrase.",
+      "Gemini receives up to ten prior recipient and relayed human-staff messages as context only, so it can resolve references and avoid irrelevant or repetitive replies.",
+      "Each autoreply or alias type can be sent only once per ticket, but different types may respond later in the same ticket."
+    ]
+  },
+  "gemini_model": {
+    "default": "`gemini-3.5-flash-lite`",
+    "description": "The Gemini model used to classify new ticket requests for AI autoreplies.",
+    "examples": [
+      "`{prefix}config set gemini_model gemini-3.5-flash-lite`"
+    ],
+    "notes": []
+  },
+  "gemini_log_channel_id": {
+    "default": "`1526602233737773146`",
+    "description": "Discord channel that receives an audit embed for every Gemini ticket check, including the reviewed message, decision, configured reply, and delivery result.",
+    "examples": [
+      "`{prefix}config set gemini_log_channel_id 1526602233737773146`"
+    ],
+    "notes": [
+      "The Gemini API key is never included in audit logs."
+    ]
+  },
+  "ai_sort_enabled": {
+    "default": "Yes",
+    "description": "Reviews all open tickets in one Gemini request at 06:00 and 18:25 Europe/London time, summarizes active inquiries, logs suggested replies, and renames unnamed or unclaimed tickets without pinging anyone.",
+    "examples": [
+      "`{prefix}config set ai_sort_enabled yes`",
+      "`{prefix}config set ai_sort_enabled no`"
+    ],
+    "notes": [
+      "Requires the `GEMINI_API_KEY` environment variable.",
+      "Each complete scheduled pass makes exactly one Gemini API request."
+    ]
+  },
+  "ai_sort_model": {
+    "default": "`gemini-3.5-flash`",
+    "description": "The Gemini model used by scheduled and manual batch ticket reviews.",
+    "examples": [
+      "`{prefix}config set ai_sort_model gemini-3.5-flash`"
+    ],
+    "notes": []
+  },
+  "ai_sort_log_channel_id": {
+    "default": "`1528151308799049921`",
+    "description": "The former Groq staff channel that receives every Gemini summary, suggested reply, rename result, and error.",
+    "examples": [
+      "`{prefix}config set ai_sort_log_channel_id 1528151308799049921`"
+    ],
+    "notes": [
+      "The Gemini API key is never included in audit logs."
+    ]
+  },
+  "recipient_reply_reminder_delay": {
+    "default": "12 hours",
+    "description": "How long a recipient follow-up may remain unanswered before subscribed users are pinged in the ticket.",
+    "examples": [
+      "`{prefix}config set recipient_reply_reminder_delay 12 hours`"
+    ],
+    "notes": [
+      "The opening ticket message is excluded; this timer begins when the recipient replies again.",
+      "A staff reply cancels the pending reminder."
+    ]
+  },
+  "recipient_reply_reminder_text": {
+    "default": "`The recipient is still awaiting a staff response. Please reply to this ticket.`",
+    "description": "The normal thread message sent with subscriber mentions when the recipient reply reminder becomes due.",
+    "examples": [
+      "`{prefix}config set recipient_reply_reminder_text This ticket needs a staff response.`"
+    ],
+    "notes": []
+  },
   "twitch_url": {
     "default": "`https://www.twitch.tv/discordmodmail/`",
     "description": "This channel dictates the linked Twitch channel when the activity is set to \"Streaming\".",
